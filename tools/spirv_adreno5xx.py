@@ -43,7 +43,7 @@ def encode(opcode, operands):
     return [((len(operands) + 1) << 16) | opcode] + operands
 
 
-def patch(words):
+def patch(words, image_depth=True):
     header = words[:5]
     bound = header[3]
     insts = list(instructions(words))
@@ -73,7 +73,7 @@ def patch(words):
     out = []
     for inst in insts:
         opcode = inst[0] & 0xFFFF
-        if opcode == OP_TYPE_IMAGE and inst[4] == 2:  # result, sampled type, dim, depth, ...
+        if image_depth and opcode == OP_TYPE_IMAGE and inst[4] == 2:  # result, sampled type, dim, depth, ...
             inst = list(inst)
             inst[4] = 0
             counts["image depth"] += 1

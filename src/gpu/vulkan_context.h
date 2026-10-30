@@ -48,6 +48,8 @@ namespace hc09::gpu
         const VkPhysicalDeviceFeatures& features() const { return enabledFeatures_; }
         bool mirrorClampToEdge() const { return mirrorClampToEdge_; }
         VkPipelineCache pipelineCache() const { return pipelineCache_; }
+        // Writes the pipeline cache to HC09_PIPELINE_CACHE (loaded again at the next start).
+        void SavePipelineCache();
         VkPhysicalDeviceProperties DeviceProperties() const { return properties_; }
         VkExtent2D Extent() const { return extent_; }
         bool hasWindow() const { return surface_ != VK_NULL_HANDLE; }

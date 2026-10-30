@@ -198,6 +198,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_startGame(JN
     };
     auto* args = new Args{ JavaString(env, image), JavaString(env, xex), JavaString(env, iso), JavaString(env, userData) };
     LoadEnvironment(args->image);
+    // The renderer keeps the driver's compiled pipelines next to the user data (the app's files folder).
+    const std::string files = args->userData.substr(0, args->userData.find_last_of('/'));
+    setenv("HC09_PIPELINE_CACHE", (files + "/vulkan_pipelines.bin").c_str(), 0);
     // The recompiled code runs deep on the guest main thread; give it the stack a desktop main thread has.
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);

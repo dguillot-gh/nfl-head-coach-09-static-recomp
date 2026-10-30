@@ -26,6 +26,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <memory>
 #include <set>
@@ -413,6 +416,34 @@ namespace hc09::gpu
             std::unordered_map<uint64_t, CompiledShader> shaders_;
             std::unordered_map<uint64_t, ShaderPair> shaderPairs_;
             std::unordered_map<uint64_t, VkPipeline> pipelines_;
+            std::set<uint64_t> failedPairs_;  // shader pairs whose pipelines the driver refused
+            // A pipeline being built on a worker thread (GetPipeline).
+            struct PipelineBuild
+            {
+                VkPipelineShaderStageCreateInfo stages[3];
+                VkPipelineVertexInputStateCreateInfo vertexInput;
+                VkPipelineInputAssemblyStateCreateInfo assembly;
+                VkPipelineViewportStateCreateInfo viewport;
+                VkPipelineRasterizationStateCreateInfo raster;
+                VkPipelineMultisampleStateCreateInfo multisample;
+                VkPipelineDepthStencilStateCreateInfo ds;
+                VkPipelineColorBlendAttachmentState target;
+                VkPipelineColorBlendStateCreateInfo blendState;
+                VkDynamicState dynamicStates[4];
+                VkPipelineDynamicStateCreateInfo dynamic;
+                VkGraphicsPipelineCreateInfo info;
+                uint64_t vsHash = 0, psHash = 0;
+                bool rectangles = false;
+                std::chrono::steady_clock::time_point start;
+                std::mutex mutex;
+                std::condition_variable finished;
+                bool done = false;
+                VkResult result = VK_INCOMPLETE;
+                VkPipeline pipeline = VK_NULL_HANDLE;
+            };
+            std::unordered_map<uint64_t, std::shared_ptr<PipelineBuild>> pendingPipelines_;
+            VkPipeline FinishPipeline(uint64_t key, uint64_t pairKey, PipelineBuild& build);
+            bool pipelinesAdded_ = false;  // since the pipeline cache was last saved
             std::map<std::pair<VkFormat, uint32_t>, VkRenderPass> renderPasses_;
             std::map<std::pair<VkImageView, VkImageView>, VkFramebuffer> framebuffers_;
             std::unordered_map<uint64_t, VkSampler> samplers_;
@@ -957,9 +988,25 @@ namespace hc09::gpu
             key = Mix(key, (uint64_t(clipDisabled) << 24) | (uint64_t(samples) << 16) | (uint64_t(rectangles) << 8) | writeMask);
             if (polyOffsetEnable)
                 key = Mix(key, (uint64_t(polyScale) << 32) | polyOffset);
-            auto& pipeline = pipelines_[key];
-            if (pipeline)
-                return pipeline;
+            // A shader pair the driver could not build a pipeline for (the V30's gives up on some large
+            // shaders with VK_INCOMPLETE, after a long try) is not tried again: its draws are skipped.
+            const uint64_t pairKey = Mix(reinterpret_cast<uintptr_t>(&vs), reinterpret_cast<uintptr_t>(&ps));
+            if (failedPairs_.count(pairKey))
+                return VK_NULL_HANDLE;
+            if (auto found = pipelines_.find(key); found != pipelines_.end())
+                return found->second;
+            // Still building in the background: these draws are skipped until it is done.
+            if (auto pending = pendingPipelines_.find(key); pending != pendingPipelines_.end())
+            {
+                const auto build = pending->second;
+                {
+                    std::lock_guard lock(build->mutex);
+                    if (!build->done)
+                        return VK_NULL_HANDLE;
+                }
+                pendingPipelines_.erase(pending);
+                return FinishPipeline(key, pairKey, *build);
+            }
 
             VkPipelineShaderStageCreateInfo stages[3]{};
             uint32_t stageCount = 0;
@@ -1062,20 +1109,74 @@ namespace hc09::gpu
             info.pDynamicState = &dynamic;
             info.layout = pair.layout;
             info.renderPass = GetRenderPass(format, samples);
-            const auto start = std::chrono::steady_clock::now();
-            const VkResult result = vkCreateGraphicsPipelines(device(), context_.pipelineCache(), 1, &info, nullptr, &pipeline);
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            if (result != VK_SUCCESS)
+            // Built on its own thread: some of the game's largest shaders take the Pixel 8's compiler
+            // 10-60 s (51ADA21A38FAF13D.ps, C0DEA8AD11DC6C29.ps). The draw waits a little (most builds
+            // take well under that); past it, the pipeline's draws are skipped until the build is done.
+            auto build = std::make_shared<PipelineBuild>();
+            std::copy(std::begin(stages), std::end(stages), build->stages);
+            build->vertexInput = vertexInput;
+            build->assembly = assembly;
+            build->viewport = viewport;
+            build->raster = raster;
+            build->multisample = multisample;
+            build->ds = ds;
+            build->target = target;
+            build->blendState = blendState;
+            build->blendState.pAttachments = &build->target;
+            std::copy(std::begin(dynamicStates), std::end(dynamicStates), build->dynamicStates);
+            build->dynamic = dynamic;
+            build->dynamic.pDynamicStates = build->dynamicStates;
+            build->info = info;
+            build->info.pStages = build->stages;
+            build->info.pVertexInputState = &build->vertexInput;
+            build->info.pInputAssemblyState = &build->assembly;
+            build->info.pViewportState = &build->viewport;
+            build->info.pRasterizationState = &build->raster;
+            build->info.pMultisampleState = &build->multisample;
+            build->info.pDepthStencilState = &build->ds;
+            build->info.pColorBlendState = &build->blendState;
+            build->info.pDynamicState = &build->dynamic;
+            build->vsHash = ActiveShader(ShaderType::Vertex)->hash;
+            build->psHash = ActiveShader(ShaderType::Pixel)->hash;
+            build->rectangles = rectangles;
+            build->start = std::chrono::steady_clock::now();
+            std::thread([build, device = device(), cache = context_.pipelineCache()] {
+                VkPipeline built = VK_NULL_HANDLE;
+                const VkResult result = vkCreateGraphicsPipelines(device, cache, 1, &build->info, nullptr, &built);
+                std::lock_guard lock(build->mutex);
+                build->result = result;
+                build->pipeline = built;
+                build->done = true;
+                build->finished.notify_all();
+            }).detach();
             {
-                std::fprintf(stderr, "[gpu] pipeline creation failed (%d): vs %016llX ps %016llX\n", int(result),
-                    (unsigned long long)ActiveShader(ShaderType::Vertex)->hash, (unsigned long long)ActiveShader(ShaderType::Pixel)->hash);
-                pipeline = VK_NULL_HANDLE;
+                std::unique_lock lock(build->mutex);
+                if (!build->finished.wait_for(lock, std::chrono::milliseconds(300), [&] { return build->done; }))
+                {
+                    std::fprintf(stderr, "[gpu] frame %d: pipeline still building after 300 ms, continuing without it (vs %016llX ps %016llX)\n",
+                        g_frame, (unsigned long long)build->vsHash, (unsigned long long)build->psHash);
+                    pendingPipelines_[key] = build;
+                    return VK_NULL_HANDLE;
+                }
+            }
+            return FinishPipeline(key, pairKey, *build);
+        }
+
+        VkPipeline Renderer::FinishPipeline(uint64_t key, uint64_t pairKey, PipelineBuild& build)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build.start).count();
+            if (build.result != VK_SUCCESS)
+            {
+                std::fprintf(stderr, "[gpu] pipeline creation failed (%d): vs %016llX ps %016llX\n", int(build.result),
+                    (unsigned long long)build.vsHash, (unsigned long long)build.psHash);
+                failedPairs_.insert(pairKey);
                 return VK_NULL_HANDLE;
             }
+            pipelines_[key] = build.pipeline;
+            pipelinesAdded_ = true;
             std::fprintf(stderr, "[gpu] frame %d: pipeline %zu built in %.0f ms (vs %016llX ps %016llX%s)\n", g_frame, pipelines_.size(), ms,
-                (unsigned long long)ActiveShader(ShaderType::Vertex)->hash, (unsigned long long)ActiveShader(ShaderType::Pixel)->hash,
-                rectangles ? ", rectangles" : "");
-            return pipeline;
+                (unsigned long long)build.vsHash, (unsigned long long)build.psHash, build.rectangles ? ", rectangles" : "");
+            return build.pipeline;
         }
 
         bool Renderer::PrepareIndices(const DrawInfo& draw, std::vector<uint32_t>& indices, bool& indexed, VkPrimitiveTopology& topology,
@@ -2028,6 +2129,12 @@ namespace hc09::gpu
         {
             EvictIdleResources(frontBuffer);
             EndPass();
+            // New pipelines go to the on-disk cache now and then (every 10 s or so).
+            if (pipelinesAdded_ && g_frame % 300 == 0)
+            {
+                pipelinesAdded_ = false;
+                context_.SavePipelineCache();
+            }
             CheckWindow();
             // Frame rate and draw counts every 5 s.
             {

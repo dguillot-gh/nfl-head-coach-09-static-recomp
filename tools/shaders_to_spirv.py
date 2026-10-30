@@ -49,6 +49,10 @@ def main():
     # (2018) in its SPIR-V reader; -O0 output compiles there, and the drivers optimize anyway.
     parser.add_argument("--opt", default="O0", choices=["O0", "O1", "O2", "O3"])
     parser.add_argument("--no-adreno5xx", action="store_true", help="skip the Adreno 5xx rewrites")
+    # (For finding which rewrite a driver dislikes.)
+    parser.add_argument("--no-split", action="store_true", help="keep the interpolators as one array")
+    parser.add_argument("--no-image-depth", action="store_true", help="keep DXC's image depth (2)")
+    parser.add_argument("--only", help="compile only the shaders whose names contain this")
     # With -O0 the register file stays an array in memory, and the V30's driver gives up on the largest
     # shaders (VK_INCOMPLETE). These spirv-opt passes promote it to SSA values without the rest of
     # DXC's optimizer (whose output crashes that driver).
@@ -61,12 +65,14 @@ def main():
     total = 0
     rewrites = {}
     for source in sorted(pathlib.Path(args.hlsl).glob("*.hlsl")):
+        if args.only and not any(name in source.name for name in args.only.split(",")):
+            continue
         total += 1
         name = source.stem  # <hash>.vs / <hash>.ps
         profile = "ps_6_0" if name.endswith(".ps") else "vs_6_0"
         target = out / (name + ".spv")
         compiled = out / (name + ".split.hlsl")
-        compiled.write_text(split_interpolators(source.read_text()))
+        compiled.write_text(source.read_text() if args.no_split else split_interpolators(source.read_text()))
         command = [args.dxc, "-spirv", "-fspv-target-env=vulkan1.0", "-T", profile, "-E", "main", "-" + args.opt, "-HV", "2018",
                    "-fvk-b-shift", "0", "0", "-fvk-t-shift", str(T_SHIFT), "0", "-fvk-s-shift", str(S_SHIFT), "0",
                    "-Fo", str(target), str(compiled)]
@@ -83,7 +89,7 @@ def main():
                 continue
         if not args.no_adreno5xx:
             data = target.read_bytes()
-            words, counts = spirv_adreno5xx.patch(list(struct.unpack(f"<{len(data) // 4}I", data)))
+            words, counts = spirv_adreno5xx.patch(list(struct.unpack(f"<{len(data) // 4}I", data)), image_depth=not args.no_image_depth)
             target.write_bytes(struct.pack(f"<{len(words)}I", *words))
             for key, value in counts.items():
                 rewrites[key] = rewrites.get(key, 0) + value

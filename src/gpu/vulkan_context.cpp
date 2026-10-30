@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace hc09::gpu
 {
@@ -141,8 +142,36 @@ namespace hc09::gpu
         if (!Check(vkCreateDevice(physical_, &deviceInfo, nullptr, &device_), "vkCreateDevice"))
             return false;
         vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
+        // The driver's compiled pipelines from earlier runs (HC09_PIPELINE_CACHE, set by the app): some of
+        // the game's shaders take the Pixel 8's compiler tens of seconds. A cache from another driver or
+        // GPU is ignored by the driver.
+        std::vector<char> cacheData;
+        if (const char* path = std::getenv("HC09_PIPELINE_CACHE"))
+        {
+            if (FILE* file = std::fopen(path, "rb"))
+            {
+                std::fseek(file, 0, SEEK_END);
+                const long size = std::ftell(file);
+                std::fseek(file, 0, SEEK_SET);
+                if (size > 0)
+                {
+                    cacheData.resize(size_t(size));
+                    if (std::fread(cacheData.data(), 1, cacheData.size(), file) != cacheData.size())
+                        cacheData.clear();
+                }
+                std::fclose(file);
+            }
+            std::fprintf(stderr, "[vulkan] pipeline cache: %zu bytes from %s\n", cacheData.size(), path);
+        }
         VkPipelineCacheCreateInfo cacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-        vkCreatePipelineCache(device_, &cacheInfo, nullptr, &pipelineCache_);
+        cacheInfo.initialDataSize = cacheData.size();
+        cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+        if (vkCreatePipelineCache(device_, &cacheInfo, nullptr, &pipelineCache_) != VK_SUCCESS)
+        {
+            cacheInfo.initialDataSize = 0;
+            cacheInfo.pInitialData = nullptr;
+            vkCreatePipelineCache(device_, &cacheInfo, nullptr, &pipelineCache_);
+        }
 
         VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -303,6 +332,28 @@ namespace hc09::gpu
     void VulkanContext::DestroyLater(std::function<void()> release)
     {
         frames_[frame_].releases.push_back(std::move(release));
+    }
+
+    void VulkanContext::SavePipelineCache()
+    {
+        const char* path = std::getenv("HC09_PIPELINE_CACHE");
+        if (!path || !pipelineCache_)
+            return;
+        size_t size = 0;
+        if (vkGetPipelineCacheData(device_, pipelineCache_, &size, nullptr) != VK_SUCCESS || size == 0)
+            return;
+        std::vector<char> data(size);
+        if (vkGetPipelineCacheData(device_, pipelineCache_, &size, data.data()) != VK_SUCCESS)
+            return;
+        // Written next to the old one and renamed over it, so a crash never leaves half a file.
+        const std::string temporary = std::string(path) + ".new";
+        FILE* file = std::fopen(temporary.c_str(), "wb");
+        if (!file)
+            return;
+        const bool written = std::fwrite(data.data(), 1, size, file) == size;
+        std::fclose(file);
+        if (written && std::rename(temporary.c_str(), path) == 0)
+            std::fprintf(stderr, "[vulkan] pipeline cache saved: %zu bytes\n", size);
     }
 
     VkCommandBuffer VulkanContext::BeginCommands()
@@ -588,11 +639,15 @@ namespace hc09::gpu
         uint32_t index = 0;
         if (swapchain_)
         {
-            const VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageReady_[frame], VK_NULL_HANDLE, &index);
+            // At most a second: a window that stops handing out images (going away, say) skips this
+            // frame's picture rather than hanging the game.
+            const VkResult result = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, imageReady_[frame], VK_NULL_HANDLE, &index);
             if (result == VK_ERROR_OUT_OF_DATE_KHR)
                 swapchainStale_ = true;
             else if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
                 acquired = true;
+            else if (result == VK_TIMEOUT || result == VK_NOT_READY)
+                std::fprintf(stderr, "[vulkan] no window image within 1 s; frame not shown\n");
             else
                 Check(result, "vkAcquireNextImageKHR");
         }
@@ -636,9 +691,11 @@ namespace hc09::gpu
             present.pSwapchains = &swapchain_;
             present.pImageIndices = &index;
             const VkResult result = vkQueuePresentKHR(queue_, &present);
-            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+            // (VK_SUBOPTIMAL_KHR is expected: the swapchain is unrotated in a rotated window and the
+            // compositor rotates it. Rebuilding for it would rebuild every frame.)
+            if (result == VK_ERROR_OUT_OF_DATE_KHR)
                 swapchainStale_ = true;
-            else if (result != VK_SUCCESS)
+            else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
                 presented = Check(result, "vkQueuePresentKHR");
         }
         frame_ = (frame_ + 1) % kFramesInFlight;
