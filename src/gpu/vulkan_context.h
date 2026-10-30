@@ -5,7 +5,7 @@
 // version, and only core 1.0 plus VK_KHR_swapchain is required.
 //
 // A frame records into two command buffers submitted together: uploads() (texture uploads, run first)
-// and commands() (everything else). Transient memory (Allocate) and descriptor sets live until the
+// and commands() (everything else); Submit() sends them early and starts new ones. Transient memory (Allocate) and descriptor sets live until the
 // frame's work has finished on the GPU, kFramesInFlight frames later.
 //
 // Not thread-safe: one thread owns it (the render thread's test loop before the game draws, then the
@@ -56,8 +56,11 @@ namespace hc09::gpu
         VkRenderPass presentPass() const { return presentPass_; }
 
         // The frame's command buffer, and the one that runs before it (texture uploads).
-        VkCommandBuffer commands() const { return commands_[frame_]; }
+        VkCommandBuffer commands() const { return frames_[frame_].commands; }
         VkCommandBuffer uploads();
+        // Sends what the frame recorded so far to the GPU and starts a new command buffer for the
+        // rest (keeps one submission short: the V30's driver gives up on a long one).
+        void Submit();
         // Frames begun so far (transient allocations of earlier frames are gone).
         uint64_t frameCount() const { return frameCount_; }
 
@@ -86,6 +89,8 @@ namespace hc09::gpu
         bool CreateSwapchain();
         void DestroySwapchain();
         void BeginFrame();
+        VkCommandBuffer BeginCommands();
+        bool SubmitRecorded(const VkSubmitInfo& waits, VkFence fence);
 
         VkInstance instance_ = VK_NULL_HANDLE;
         VkPhysicalDevice physical_ = VK_NULL_HANDLE;
@@ -123,7 +128,10 @@ namespace hc09::gpu
             std::vector<VkDescriptorPool> pools;
             size_t pool = 0;            // the pool sets come from
             std::vector<std::function<void()>> releases;
-            bool uploadsBegun = false;
+            std::vector<VkCommandBuffer> buffers;  // from the pool, reused frame after frame
+            size_t nextBuffer = 0;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            VkCommandBuffer uploads = VK_NULL_HANDLE;  // null until something is uploaded
         };
         Frame frames_[kFramesInFlight];
         bool CreateChunk(VkDeviceSize size, Chunk& chunk);
@@ -131,8 +139,6 @@ namespace hc09::gpu
         VkDescriptorPool CreatePool();
 
         VkCommandPool commandPool_ = VK_NULL_HANDLE;
-        VkCommandBuffer commands_[kFramesInFlight]{};
-        VkCommandBuffer uploads_[kFramesInFlight]{};
         VkFence frameDone_[kFramesInFlight]{};
         VkSemaphore imageReady_[kFramesInFlight]{};
         VkSemaphore renderDone_[kFramesInFlight]{};

@@ -6,6 +6,10 @@ instructions. Found with tools/vkprobe/vkpipeprobe on the V30:
     of identical components) is used directly as the scalar condition.
   - NMin/NMax -> FMin/FMax (differ only when an operand is NaN).
 
+And one it compiles but runs wrongly (found in the app, the intro movie drawing green):
+  - OpTypeImage with Depth 2 ("not known", DXC's for every texture): sampling returns 0. Rewritten
+    to Depth 0 (not a depth image), as glslang declares them; the translator never compares depth.
+
 Usage: python tools/spirv_adreno5xx.py <in.spv> <out.spv>   (prints the counts of each rewrite)
 Also importable: patch(words) -> (words, counts).
 """
@@ -16,6 +20,7 @@ OP_EXT_INST_IMPORT = 11
 OP_EXT_INST = 12
 OP_TYPE_BOOL = 20
 OP_TYPE_VECTOR = 23
+OP_TYPE_IMAGE = 25
 OP_FUNCTION = 54
 OP_COMPOSITE_CONSTRUCT = 80
 OP_COMPOSITE_EXTRACT = 81
@@ -64,11 +69,15 @@ def patch(words):
         if component == bool_type:
             bool_vectors[count] = type_id
 
-    counts = {"vector selects": 0, "nmin/nmax": 0}
+    counts = {"vector selects": 0, "nmin/nmax": 0, "image depth": 0}
     out = []
     for inst in insts:
         opcode = inst[0] & 0xFFFF
-        if opcode == OP_EXT_INST and inst[3] in glsl and inst[4] in REPLACE_EXT:
+        if opcode == OP_TYPE_IMAGE and inst[4] == 2:  # result, sampled type, dim, depth, ...
+            inst = list(inst)
+            inst[4] = 0
+            counts["image depth"] += 1
+        elif opcode == OP_EXT_INST and inst[3] in glsl and inst[4] in REPLACE_EXT:
             inst = list(inst)
             inst[4] = REPLACE_EXT[inst[4]]
             counts["nmin/nmax"] += 1

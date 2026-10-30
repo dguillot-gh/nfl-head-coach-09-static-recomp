@@ -149,13 +149,6 @@ namespace hc09::gpu
         poolInfo.queueFamilyIndex = queueFamily_;
         if (!Check(vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_), "vkCreateCommandPool"))
             return false;
-        VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        allocateInfo.commandPool = commandPool_;
-        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocateInfo.commandBufferCount = kFramesInFlight;
-        if (!Check(vkAllocateCommandBuffers(device_, &allocateInfo, commands_), "vkAllocateCommandBuffers") ||
-            !Check(vkAllocateCommandBuffers(device_, &allocateInfo, uploads_), "vkAllocateCommandBuffers"))
-            return false;
         for (uint32_t i = 0; i < kFramesInFlight; i++)
         {
             VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -312,18 +305,58 @@ namespace hc09::gpu
         frames_[frame_].releases.push_back(std::move(release));
     }
 
+    VkCommandBuffer VulkanContext::BeginCommands()
+    {
+        Frame& frame = frames_[frame_];
+        if (frame.nextBuffer == frame.buffers.size())
+        {
+            VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            allocateInfo.commandPool = commandPool_;
+            allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocateInfo.commandBufferCount = 1;
+            VkCommandBuffer buffer = VK_NULL_HANDLE;
+            Check(vkAllocateCommandBuffers(device_, &allocateInfo, &buffer), "vkAllocateCommandBuffers");
+            frame.buffers.push_back(buffer);
+        }
+        VkCommandBuffer buffer = frame.buffers[frame.nextBuffer++];
+        vkResetCommandBuffer(buffer, 0);
+        VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(buffer, &begin);
+        return buffer;
+    }
+
     VkCommandBuffer VulkanContext::uploads()
     {
         Frame& frame = frames_[frame_];
-        if (!frame.uploadsBegun)
+        if (!frame.uploads)
+            frame.uploads = BeginCommands();
+        return frame.uploads;
+    }
+
+    bool VulkanContext::SubmitRecorded(const VkSubmitInfo& waits, VkFence fence)
+    {
+        Frame& frame = frames_[frame_];
+        VkCommandBuffer buffers[2];
+        uint32_t count = 0;
+        if (frame.uploads)
         {
-            VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkResetCommandBuffer(uploads_[frame_], 0);
-            vkBeginCommandBuffer(uploads_[frame_], &begin);
-            frame.uploadsBegun = true;
+            vkEndCommandBuffer(frame.uploads);
+            buffers[count++] = frame.uploads;
+            frame.uploads = VK_NULL_HANDLE;
         }
-        return uploads_[frame_];
+        vkEndCommandBuffer(frame.commands);
+        buffers[count++] = frame.commands;
+        VkSubmitInfo submit = waits;
+        submit.commandBufferCount = count;
+        submit.pCommandBuffers = buffers;
+        return Check(vkQueueSubmit(queue_, 1, &submit, fence), "vkQueueSubmit");
+    }
+
+    void VulkanContext::Submit()
+    {
+        SubmitRecorded({ VK_STRUCTURE_TYPE_SUBMIT_INFO }, VK_NULL_HANDLE);
+        frames_[frame_].commands = BeginCommands();
     }
 
     void VulkanContext::BeginFrame()
@@ -340,11 +373,9 @@ namespace hc09::gpu
         for (VkDescriptorPool pool : frame.pools)
             vkResetDescriptorPool(device_, pool, 0);
         frame.pool = 0;
-        frame.uploadsBegun = false;
-        vkResetCommandBuffer(commands_[frame_], 0);
-        VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(commands_[frame_], &begin);
+        frame.nextBuffer = 0;
+        frame.uploads = VK_NULL_HANDLE;
+        frame.commands = BeginCommands();
         frameCount_++;
     }
 
@@ -545,7 +576,7 @@ namespace hc09::gpu
     bool VulkanContext::EndFrame(const PresentDraw& draw, const float clear[3])
     {
         const uint32_t frame = frame_;
-        VkCommandBuffer commands = commands_[frame];
+        VkCommandBuffer commands = frames_[frame].commands;
         if (surface_ && (swapchainStale_ || !swapchain_))
         {
             DestroySwapchain();
@@ -583,16 +614,6 @@ namespace hc09::gpu
                 draw(commands, extent_);
             vkCmdEndRenderPass(commands);
         }
-        vkEndCommandBuffer(commands);
-
-        VkCommandBuffer buffers[2];
-        uint32_t bufferCount = 0;
-        if (frames_[frame].uploadsBegun)
-        {
-            vkEndCommandBuffer(uploads_[frame]);
-            buffers[bufferCount++] = uploads_[frame];
-        }
-        buffers[bufferCount++] = commands;
         const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
         if (acquired)
@@ -603,10 +624,8 @@ namespace hc09::gpu
             submit.signalSemaphoreCount = 1;
             submit.pSignalSemaphores = &renderDone_[frame];
         }
-        submit.commandBufferCount = bufferCount;
-        submit.pCommandBuffers = buffers;
         vkResetFences(device_, 1, &frameDone_[frame]);
-        bool presented = Check(vkQueueSubmit(queue_, 1, &submit, frameDone_[frame]), "vkQueueSubmit");
+        bool presented = SubmitRecorded(submit, frameDone_[frame]);
 
         if (acquired && presented)
         {

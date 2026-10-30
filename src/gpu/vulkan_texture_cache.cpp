@@ -208,6 +208,9 @@ namespace hc09::gpu
 
         VkComponentMapping EncodeMapping(uint32_t swizzle, const uint8_t remap[4])
         {
+            static const bool identity = std::getenv("HC09_IDENTITY_SWIZZLE") != nullptr;  // debugging
+            if (identity)
+                return {};
             VkComponentSwizzle components[4];
             for (int i = 0; i < 4; i++)
             {
@@ -442,6 +445,7 @@ namespace hc09::gpu
             out = {};
             out.width = it->second.width;
             out.height = it->second.height;
+            out.format = it->second.format;
             const VkComponentMapping red{ VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R };
             out.view = GetView(it->second.views, it->second.image, it->second.format, VK_IMAGE_VIEW_TYPE_2D, red, 1, 1);
             return out.view != VK_NULL_HANDLE;
@@ -490,6 +494,7 @@ namespace hc09::gpu
             // The target holds red, green, blue, alpha; memory has red and blue exchanged when
             // the resolve swapped them, and the fetch swizzle applies to the memory order.
             const uint8_t swapped[4] = { 2, 1, 0, 3 };
+            out.format = it->second.format;
             out.view = GetView(it->second.views, it->second.image, it->second.format, VK_IMAGE_VIEW_TYPE_2D,
                 EncodeMapping(fetch.swizzle(), it->second.swapRedBlue ? swapped : identity), 1, 1);
             out.type = VK_IMAGE_VIEW_TYPE_2D;
@@ -785,6 +790,9 @@ namespace hc09::gpu
                         DecodeTexels(format, info, dest, rowBytes, levelWidth, levelHeight, upload.cpu);
                     else
                         std::memcpy(upload.cpu, dest, bytes);
+                    static const bool fill = std::getenv("HC09_TEXTURE_FILL") != nullptr;  // debugging: every texel 0x80
+                    if (fill)
+                        std::memset(upload.cpu, 0x80, bytes);
                     if (uploadBuffer != upload.buffer && !regions.empty())
                     {
                         // The upload memory moved to a new chunk: copy what went into the last one.
@@ -807,6 +815,7 @@ namespace hc09::gpu
             Barrier(commands, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, levels, layers);
             entry.uploaded = true;
         }
+        out.format = entry.format;
         out.view = GetView(entry.views, entry.image, entry.format, out.type, EncodeMapping(fetch.swizzle(), info.decode ? identity : info.remap),
             levels, cube ? 6 : 1);
         if (!out.view)

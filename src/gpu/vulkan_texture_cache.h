@@ -23,6 +23,7 @@ namespace hc09::gpu
     {
         VkImageView view = VK_NULL_HANDLE;
         VkImageViewType type = VK_IMAGE_VIEW_TYPE_2D;
+        VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t depth = 1;    // slices of a 3D or stacked texture

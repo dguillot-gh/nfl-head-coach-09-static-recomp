@@ -28,6 +28,17 @@ SPIRV_OPT_PASSES = ["--scalar-replacement=0", "--ssa-rewrite", "--ccp", "--simpl
                     "--eliminate-dead-code-aggressive", "--merge-blocks", "--eliminate-dead-code-aggressive"]
 
 
+def split_interpolators(hlsl):
+    """The translator passes 16 interpolators as one array (float4 interpolators[16] : TEXCOORD0). The LG
+    V30's Adreno driver reads such an input array as garbage, so each becomes its own variable
+    (TEXCOORD0..15, the same locations 0..15)."""
+    members = "".join(f"    float4 interpolator{i} : TEXCOORD{i};\n" for i in range(16))
+    hlsl = hlsl.replace("    float4 interpolators[16] : TEXCOORD0;\n", members)
+    hlsl = hlsl.replace("    output.interpolators = o;\n", "".join(f"    output.interpolator{i} = o[{i}];\n" for i in range(16)))
+    return hlsl.replace("    [unroll] for (int k = 0; k < 16; k++) r[k] = input.interpolators[k];\n",
+                        "".join(f"    r[{i}] = input.interpolator{i};\n" for i in range(16)))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("hlsl")
@@ -54,10 +65,13 @@ def main():
         name = source.stem  # <hash>.vs / <hash>.ps
         profile = "ps_6_0" if name.endswith(".ps") else "vs_6_0"
         target = out / (name + ".spv")
+        compiled = out / (name + ".split.hlsl")
+        compiled.write_text(split_interpolators(source.read_text()))
         command = [args.dxc, "-spirv", "-fspv-target-env=vulkan1.0", "-T", profile, "-E", "main", "-" + args.opt, "-HV", "2018",
                    "-fvk-b-shift", "0", "0", "-fvk-t-shift", str(T_SHIFT), "0", "-fvk-s-shift", str(S_SHIFT), "0",
-                   "-Fo", str(target), str(source)]
+                   "-Fo", str(target), str(compiled)]
         result = subprocess.run(command, capture_output=True, text=True)
+        compiled.unlink()
         if result.returncode != 0:
             failed.append((name, "dxc", result.stderr.strip().splitlines()[:6]))
             continue

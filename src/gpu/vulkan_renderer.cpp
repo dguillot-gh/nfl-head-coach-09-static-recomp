@@ -289,8 +289,16 @@ namespace hc09::gpu
             std::vector<uint32_t> bindings;  // descriptor bindings the SPIR-V declares
         };
 
-        // Descriptor bindings (from SPIR-V OpDecorate ... Binding) of a shader module.
-        std::vector<uint32_t> SpirvBindings(const uint32_t* words, size_t count)
+        // The binding a shader's resource has in the set: the samplers move down from 100..131 to
+        // follow the textures (82..113), since sparse binding numbers that high are risky on old drivers.
+        uint32_t HostBinding(uint32_t binding)
+        {
+            return binding >= kSamplerBinding ? kFallbackBinding + 32 + (binding - kSamplerBinding) : binding;
+        }
+
+        // Descriptor bindings (from SPIR-V OpDecorate ... Binding) of a shader module, which are
+        // renumbered in place to HostBinding's.
+        std::vector<uint32_t> SpirvBindings(uint32_t* words, size_t count)
         {
             std::vector<uint32_t> bindings;
             for (size_t i = 5; i < count;)
@@ -299,7 +307,10 @@ namespace hc09::gpu
                 if (length == 0)
                     break;
                 if (opcode == 71 && length >= 4 && words[i + 2] == 33)  // OpDecorate <id> Binding <n>
+                {
                     bindings.push_back(words[i + 3]);
+                    words[i + 3] = HostBinding(words[i + 3]);
+                }
                 i += length;
             }
             std::sort(bindings.begin(), bindings.end());
@@ -364,6 +375,7 @@ namespace hc09::gpu
             DepthTarget* passDepth_ = nullptr;
 
             void Resolve();
+            void ResolveCopy();
             void ResolveDepth(uint32_t control);
             void ClearRect(RenderTarget& target, DepthTarget& depth, VkImageAspectFlags aspects, const VkClearValue& value,
                 const VkRect2D& rect);
@@ -577,7 +589,9 @@ namespace hc09::gpu
                 barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
                 vkCmdPipelineBarrier(commands(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                     nullptr, 1, &barrier);
-                const VkClearColorValue zero{};
+                // HC09_DUMMY_TEXTURES=1 (debugging): every draw samples these, grey.
+                static const bool grey = std::getenv("HC09_DUMMY_TEXTURES") != nullptr;
+                const VkClearColorValue zero{ { grey ? 0.5f : 0.0f, grey ? 0.5f : 0.0f, grey ? 0.5f : 0.0f, grey ? 1.0f : 0.0f } };
                 vkCmdClearColorImage(commands(), image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &barrier.subresourceRange);
                 barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -696,6 +710,12 @@ namespace hc09::gpu
             const bool pixel = microcode->type == ShaderType::Pixel;
             char name[64];
             std::snprintf(name, sizeof(name), "%016llX.%s", (unsigned long long)microcode->hash, pixel ? "ps" : "vs");
+            // HC09_DUMP_ON_SHADER=<hash> (debugging): dump the rest of the frame where that shader first draws.
+            if (const char* dump = std::getenv("HC09_DUMP_ON_SHADER"); dump && std::strstr(dump, std::string(name, 16).c_str()))
+            {
+                g_dumpFrame = g_frame;
+                std::fprintf(stderr, "[frame] %s first used: dumping frame %d\n", name, g_frame);
+            }
             // HC09_SKIP_SHADERS=<hash>[,<hash>...] (debugging): draws with these shaders are skipped.
             if (const char* skip = std::getenv("HC09_SKIP_SHADERS"); skip && std::strstr(skip, std::string(name, 16).c_str()))
             {
@@ -743,7 +763,7 @@ namespace hc09::gpu
             pair.bindings.assign(bindings.begin(), bindings.end());
             std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
             for (uint32_t binding : pair.bindings)
-                layoutBindings.push_back({ binding, BindingType(binding), 1,
+                layoutBindings.push_back({ HostBinding(binding), BindingType(binding), 1,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
             if (!context_.features().geometryShader)
                 for (auto& binding : layoutBindings)
@@ -1554,7 +1574,19 @@ namespace hc09::gpu
                 const bool linear = minFilter == 1 || magFilter == 1;
                 const uint32_t mipFilter = pick((chosen >> 4) & 3, 3, fetch.mipFilter());
                 const uint32_t aniso = pick((chosen >> 6) & 7, 7, fetch.anisoFilter());
-                if (aniso >= 2 && aniso <= 5 && context_.features().samplerAnisotropy)
+                // Formats the device cannot filter (32-bit floats on the V30: depth resolves) are sampled
+                // with point filtering; linear filtering them is undefined, and hung the V30's GPU.
+                static std::unordered_map<VkFormat, bool> filterable;
+                auto canFilter = filterable.find(texture.format);
+                if (canFilter == filterable.end())
+                    canFilter = filterable.emplace(texture.format, texture.format == VK_FORMAT_UNDEFINED ||
+                        context_.SupportsFormat(texture.format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)).first;
+                if (!canFilter->second)
+                {
+                    sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+                    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                }
+                else if (aniso >= 2 && aniso <= 5 && context_.features().samplerAnisotropy)
                 {
                     sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
                     sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
@@ -1602,7 +1634,7 @@ namespace hc09::gpu
                 VkWriteDescriptorSet& write = writes[i];
                 write = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                 write.dstSet = set;
-                write.dstBinding = binding;
+                write.dstBinding = HostBinding(binding);
                 write.descriptorCount = 1;
                 write.descriptorType = BindingType(binding);
                 if (binding == kFloatConstantsBinding)
@@ -1615,7 +1647,8 @@ namespace hc09::gpu
                 {
                     const uint32_t n = binding - kTextureBinding;
                     const VkImageView dummy = (cubeMask >> n) & 1 ? dummyCube_.view : (volumeMask >> n) & 1 ? dummy3D_.view : dummy2D_.view;
-                    images[i] = { VK_NULL_HANDLE, textureViews[n] ? textureViews[n] : dummy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                    static const bool dummyOnly = std::getenv("HC09_DUMMY_TEXTURES") != nullptr;
+                    images[i] = { VK_NULL_HANDLE, textureViews[n] && !dummyOnly ? textureViews[n] : dummy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 }
                 else if (binding < kSamplerBinding)
                 {
@@ -1690,6 +1723,15 @@ namespace hc09::gpu
         }
 
         void Renderer::Resolve()
+        {
+            ResolveCopy();
+            // The frame's work so far goes to the GPU: a frame of many full-screen passes (the title's
+            // blur chain, resolved after each pass) in one submission makes the V30's driver give up.
+            EndPass();
+            context_.Submit();
+        }
+
+        void Renderer::ResolveCopy()
         {
             const uint32_t control = ReadRegister(reg::kCopyControl);
             const uint32_t source = control & 7;
