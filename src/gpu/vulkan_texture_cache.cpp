@@ -351,6 +351,7 @@ namespace hc09::gpu
         resolved.checkedFrame = FrameNumber();
         resolved.lastUsedFrame = FrameNumber();
         recent_.clear();
+        recentGeneration_++;
     }
 
     bool VulkanTextureCache::ResolveStillValid(uint32_t address, Resolved& resolved, int frame)
@@ -391,6 +392,7 @@ namespace hc09::gpu
         ReleaseViews(it->second.views);
         resolved_.erase(it);
         recent_.clear();
+        recentGeneration_++;
     }
 
     void VulkanTextureCache::Evict(int frame)
@@ -411,6 +413,7 @@ namespace hc09::gpu
             }
         }
         recent_.clear();
+        recentGeneration_++;
     }
 
     bool VulkanTextureCache::Get(const TextureFetch& fetch, BoundTexture& out)
@@ -419,6 +422,7 @@ namespace hc09::gpu
         if (recentFrame_ != frameNow)
         {
             recent_.clear();
+            recentGeneration_++;
             recentFrame_ = frameNow;
         }
         const uint64_t recentKey = XXH3_64bits(fetch.words, sizeof(fetch.words));

@@ -39,6 +39,9 @@ namespace hc09::gpu
         // Texture for a fetch constant, uploaded/refreshed as needed. Returns false when the
         // format or dimension is not supported yet.
         bool Get(const TextureFetch& fetch, BoundTexture& out);
+        // Changes whenever Get might answer a fetch constant differently than before (new frame, a resolve,
+        // an eviction): callers may keep Get's answers while it stays the same.
+        uint64_t generation() const { return recentGeneration_; }
 
         // Registers a resolve destination so later fetches from `address` sample it (kept in
         // SHADER_READ_ONLY_OPTIMAL between resolves).
@@ -117,6 +120,7 @@ namespace hc09::gpu
         };
         std::unordered_map<uint64_t, Recent> recent_;
         int recentFrame_ = -1;
+        uint64_t recentGeneration_ = 0;  // counts the clears of recent_
 
         VulkanContext& context_;
         std::unordered_map<uint64_t, Entry> entries_;

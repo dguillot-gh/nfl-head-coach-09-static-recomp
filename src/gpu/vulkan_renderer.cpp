@@ -17,6 +17,7 @@
 
 #include <android/asset_manager.h>
 #include <android/native_window.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <atomic>
@@ -363,6 +364,25 @@ namespace hc09::gpu
             return VK_DESCRIPTOR_TYPE_SAMPLER;
         }
 
+        // The set layout of a shader pair: every binding either shader declares, visible only to the stages
+        // that declare it. (Visible to all stages, a shader's bindings depended on its partner, and the
+        // V30's driver, which keeps each compiled shader with the bindings it saw, refused later pairs:
+        // "Bind group info mismatches the shader source".) The rectangle geometry shader sees them all.
+        std::vector<VkDescriptorSetLayoutBinding> SetLayoutBindings(const std::vector<uint32_t>& vs, const std::vector<uint32_t>& ps,
+            bool geometryShader)
+        {
+            std::map<uint32_t, VkShaderStageFlags> stages;
+            for (uint32_t binding : vs)
+                stages[binding] |= VK_SHADER_STAGE_VERTEX_BIT;
+            for (uint32_t binding : ps)
+                stages[binding] |= VK_SHADER_STAGE_FRAGMENT_BIT;
+            std::vector<VkDescriptorSetLayoutBinding> layout;
+            for (const auto& [binding, flags] : stages)
+                layout.push_back({ HostBinding(binding), BindingType(binding), 1,
+                    flags | (geometryShader ? VkShaderStageFlags(VK_SHADER_STAGE_GEOMETRY_BIT) : 0), nullptr });
+            return layout;
+        }
+
         // A pipeline as the renderer builds it: the shader pair and the render state it depends on. The
         // pre-compiler replays these from a list (pipelines.txt), so they are plain numbers.
         struct PipelineDesc
@@ -554,7 +574,20 @@ namespace hc09::gpu
             {
                 std::lock_guard lock(mutex_);
                 used_--;
-                free_.notify_one();
+                free_.notify_all();
+            }
+            // Every slot: the pipeline builds alone (ReleaseAll after).
+            void AcquireAll()
+            {
+                std::unique_lock lock(mutex_);
+                free_.wait(lock, [this] { return used_ == 0; });
+                used_ = 3;
+            }
+            void ReleaseAll()
+            {
+                std::lock_guard lock(mutex_);
+                used_ = 0;
+                free_.notify_all();
             }
 
         private:
@@ -730,6 +763,34 @@ namespace hc09::gpu
             std::unordered_map<uint32_t, ResolveTarget> resolveTargets_;
             uint32_t skippedDraws_ = 0;
             uint32_t draws_ = 0;
+            // What the last draw sampling each fetch slot bound (Draw reuses it while the inputs repeat).
+            struct TextureSlot
+            {
+                TextureFetch fetch{};
+                VkImageViewType wanted = VK_IMAGE_VIEW_TYPE_2D;
+                uint16_t chosen = 0;
+                int frame = -1;
+                uint64_t generation = 0;
+                VkImageView view = VK_NULL_HANDLE, fallback = VK_NULL_HANDLE;
+                VkSampler sampler = VK_NULL_HANDLE;
+                float size[4]{};
+            };
+            TextureSlot textureSlots_[32];
+            // State already set in the command buffer being recorded (dynamic state outlives pipeline
+            // binds and render passes within one buffer); forgotten when Submit/EndFrame start a new one.
+            struct RecordedState
+            {
+                VkCommandBuffer commands = VK_NULL_HANDLE;
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                uint32_t stencilReference = ~0u;
+                VkRect2D scissor{ { -1, -1 }, { 0, 0 } };
+            };
+            RecordedState recorded_;
+            // Scratch space Draw reuses instead of allocating per draw.
+            std::vector<uint32_t> drawIndices_, sourceIndices_;
+            std::vector<VkWriteDescriptorSet> descriptorWrites_;
+            std::vector<VkDescriptorBufferInfo> descriptorBuffers_;
+            std::vector<VkDescriptorImageInfo> descriptorImages_;
         };
 
         bool Renderer::Initialize()
@@ -1000,6 +1061,27 @@ namespace hc09::gpu
                 ANativeWindow_release(window);
         }
 
+        // A shader the APK has no SPIR-V for: its microcode goes to HC09_MISSING_SHADERS/<hash>.<vs|ps>.bin
+        // (big-endian, as HC09_DUMP_SHADERS writes it) for tools/xenos_to_hlsl and shaders_to_spirv.py.
+        void SaveMissingShader(const ShaderMicrocode& microcode, const char* name)
+        {
+            const char* folder = std::getenv("HC09_MISSING_SHADERS");
+            if (!folder)
+                return;
+            mkdir(folder, 0755);
+            const std::string path = std::string(folder) + "/" + name + ".bin";
+            FILE* file = std::fopen(path.c_str(), "wb");
+            if (!file)
+                return;
+            for (uint32_t dword : microcode.dwords)
+            {
+                const uint32_t big = __builtin_bswap32(dword);  // the console's byte order
+                std::fwrite(&big, 4, 1, file);
+            }
+            std::fclose(file);
+            std::fprintf(stderr, "[shader] saved %s\n", path.c_str());
+        }
+
         const CompiledShader& Renderer::GetShader(const std::shared_ptr<const ShaderMicrocode>& microcode)
         {
             auto& compiled = shaders_[microcode->hash];
@@ -1035,6 +1117,7 @@ namespace hc09::gpu
             if (!asset)
             {
                 std::fprintf(stderr, "[shader] missing %s\n", name);
+                SaveMissingShader(*microcode, name);
                 return compiled;
             }
             const size_t bytes = size_t(AAsset_getLength(asset));
@@ -1060,13 +1143,8 @@ namespace hc09::gpu
             std::set<uint32_t> bindings(vs.bindings.begin(), vs.bindings.end());
             bindings.insert(ps.bindings.begin(), ps.bindings.end());
             pair.bindings.assign(bindings.begin(), bindings.end());
-            std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
-            for (uint32_t binding : pair.bindings)
-                layoutBindings.push_back({ HostBinding(binding), BindingType(binding), 1,
-                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
-            if (!context_.features().geometryShader)
-                for (auto& binding : layoutBindings)
-                    binding.stageFlags &= ~VK_SHADER_STAGE_GEOMETRY_BIT;
+            const std::vector<VkDescriptorSetLayoutBinding> layoutBindings = SetLayoutBindings(vs.bindings, ps.bindings,
+                rectangleGs_ != VK_NULL_HANDLE);
             VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             setInfo.bindingCount = uint32_t(layoutBindings.size());
             setInfo.pBindings = layoutBindings.data();
@@ -1120,6 +1198,9 @@ namespace hc09::gpu
             info.framebuffer = GetFramebuffer(target, depth);
             info.renderArea.extent = { kTargetWidth * g_scale, kTargetHeight * g_scale };
             vkCmdBeginRenderPass(commands(), &info, VK_SUBPASS_CONTENTS_INLINE);
+            // (Other recording, such as depth copies, the present and new command buffers after a submit,
+            // happens between passes: what Draw set before may be gone.)
+            recorded_ = {};
             passTarget_ = &target;
             passDepth_ = &depth;
         }
@@ -1261,8 +1342,20 @@ namespace hc09::gpu
             std::thread([build, device = device(), cache = context_.pipelineCache()] {
                 VkPipeline built = VK_NULL_HANDLE;
                 g_buildSlots.Acquire();
-                const VkResult result = vkCreateGraphicsPipelines(device, cache, 1, &build->info, nullptr, &built);
+                VkResult result = vkCreateGraphicsPipelines(device, cache, 1, &build->info, nullptr, &built);
                 g_buildSlots.Release();
+                // The V30's compiler fails random pipelines (VK_INCOMPLETE; 2-10 a run, different ones each
+                // time, which built fine before): two more tries, each with no other build running, the
+                // last without the pipeline cache (its driver logs cache blobs that fail to load).
+                for (int retry = 0; retry < 2 && result != VK_SUCCESS; retry++)
+                {
+                    std::fprintf(stderr, "[gpu] pipeline build failed (%d), trying again alone%s: vs %016llX ps %016llX\n", int(result),
+                        retry == 1 ? " without the cache" : "", (unsigned long long)build->desc.vs, (unsigned long long)build->desc.ps);
+                    built = VK_NULL_HANDLE;
+                    g_buildSlots.AcquireAll();
+                    result = vkCreateGraphicsPipelines(device, retry == 1 ? VK_NULL_HANDLE : cache, 1, &build->info, nullptr, &built);
+                    g_buildSlots.ReleaseAll();
+                }
                 std::lock_guard lock(build->mutex);
                 build->result = result;
                 build->pipeline = built;
@@ -1411,12 +1504,8 @@ namespace hc09::gpu
                         }
                         shared->building[worker] = i;
                         // The same set layout as GetShaderPair makes (pipeline layouts only need to match).
-                        std::set<uint32_t> bindings(vs->second.begin(), vs->second.end());
-                        bindings.insert(ps->second.begin(), ps->second.end());
-                        std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
-                        for (uint32_t binding : bindings)
-                            layoutBindings.push_back({ HostBinding(binding), BindingType(binding), 1,
-                                VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT | (gs ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) | VK_SHADER_STAGE_FRAGMENT_BIT), nullptr });
+                        const std::vector<VkDescriptorSetLayoutBinding> layoutBindings = SetLayoutBindings(vs->second, ps->second,
+                            gs != VK_NULL_HANDLE);
                         VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
                         setInfo.bindingCount = uint32_t(layoutBindings.size());
                         setInfo.pBindings = layoutBindings.data();
@@ -1518,7 +1607,8 @@ namespace hc09::gpu
                 return true;
 
             // Source indices (as 32-bit; 16-bit restart values widen to 0xFFFFFFFF).
-            std::vector<uint32_t> source(draw.indexCount);
+            std::vector<uint32_t>& source = sourceIndices_;
+            source.resize(draw.indexCount);
             for (uint32_t i = 0; i < draw.indexCount; i++)
             {
                 uint32_t value = i;
@@ -1565,7 +1655,7 @@ namespace hc09::gpu
                     indices.push_back(source[0]);
                 break;
             default:
-                indices = std::move(source);
+                indices.swap(source);  // (both buffers are kept for the next draws)
                 break;
             }
             return true;
@@ -1722,7 +1812,8 @@ namespace hc09::gpu
                 return;
             }
 
-            std::vector<uint32_t> indices;
+            std::vector<uint32_t>& indices = drawIndices_;
+            indices.clear();
             bool indexed = false, rectangles = false;
             VkPrimitiveTopology topology;
             if (!PrepareIndices(draw, indices, indexed, topology, rectangles))
@@ -1936,6 +2027,20 @@ namespace hc09::gpu
                 BoundTexture texture;
                 const VkImageViewType wanted = (cubeMask >> n) & 1 ? VK_IMAGE_VIEW_TYPE_CUBE
                     : (volumeMask >> n) & 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+                const uint16_t chosen = ps.info.textureFilters[n] != TranslatedShader::kFiltersFromConstant ? ps.info.textureFilters[n]
+                                                                                                           : vs.info.textureFilters[n];
+                // The same fetch constant, view type and filters as the last draw using this slot, in this
+                // frame with no resolve since: the same views, sizes and sampler (most draws repeat them).
+                TextureSlot& slot = textureSlots_[n];
+                if (slot.frame == g_frame && slot.generation == textures_->generation() && slot.wanted == wanted &&
+                    slot.chosen == chosen && std::memcmp(slot.fetch.words, fetch.words, sizeof(fetch.words)) == 0 && g_frame != g_dumpFrame)
+                {
+                    textureViews[n] = slot.view;
+                    fallbackViews[n] = slot.fallback;
+                    samplers[n] = slot.sampler;
+                    std::memcpy(state.textureSizes[n], slot.size, sizeof(slot.size));
+                    continue;
+                }
                 const bool fetched = textures_->Get(fetch, texture);
                 const bool bound = fetched && texture.type == wanted;
                 // The shader samples a cube or 3D texture but the constant holds a 2D one: the
@@ -1978,8 +2083,6 @@ namespace hc09::gpu
                 // Xenos filters: 0 point, 1 linear; mip filter 2 = base map only. Anisotropy n
                 // allows up to 2^(n-1):1. A fetch instruction can choose its own (3, or 7 for
                 // anisotropy, keeps the constant's).
-                const uint16_t chosen = ps.info.textureFilters[n] != TranslatedShader::kFiltersFromConstant ? ps.info.textureFilters[n]
-                                                                                                           : vs.info.textureFilters[n];
                 auto pick = [](uint32_t instruction, uint32_t useConstant, uint32_t constant) {
                     return instruction == useConstant ? constant : instruction;
                 };
@@ -2030,6 +2133,8 @@ namespace hc09::gpu
                 if (sampler.maxLod < sampler.minLod)
                     sampler.maxLod = sampler.minLod;
                 samplers[n] = GetSampler(sampler);
+                slot = { fetch, wanted, chosen, g_frame, textures_->generation(), textureViews[n], fallbackViews[n], samplers[n] };
+                std::memcpy(slot.size, state.textureSizes[n], sizeof(slot.size));
             }
 
             // The draw's descriptors, for every binding its shaders declare.
@@ -2040,9 +2145,12 @@ namespace hc09::gpu
                 return;
             std::memcpy(drawState.cpu, &state, sizeof(state));
             const size_t bindingCount = pair->bindings.size();
-            std::vector<VkWriteDescriptorSet> writes(bindingCount);
-            std::vector<VkDescriptorBufferInfo> buffers(bindingCount);
-            std::vector<VkDescriptorImageInfo> images(bindingCount);
+            std::vector<VkWriteDescriptorSet>& writes = descriptorWrites_;
+            std::vector<VkDescriptorBufferInfo>& buffers = descriptorBuffers_;
+            std::vector<VkDescriptorImageInfo>& images = descriptorImages_;
+            writes.resize(bindingCount);
+            buffers.resize(bindingCount);
+            images.resize(bindingCount);
             for (size_t i = 0; i < bindingCount; i++)
             {
                 const uint32_t binding = pair->bindings[i];
@@ -2094,13 +2202,27 @@ namespace hc09::gpu
 
             BeginPass(target, depth);
             VkCommandBuffer list = commands();
-            vkCmdBindPipeline(list, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            // Only what changed since the last draw in this pass (all draw pipelines share the dynamic states).
+            if (recorded_.pipeline != pipeline)
+            {
+                vkCmdBindPipeline(list, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                recorded_.pipeline = pipeline;
+            }
             vkCmdBindDescriptorSets(list, VK_PIPELINE_BIND_POINT_GRAPHICS, pair->layout, 0, 1, &set, 0, nullptr);
-            vkCmdSetStencilReference(list, VK_STENCIL_FACE_FRONT_AND_BACK, ReadRegister(reg::kStencilRefMask) & 0xFF);
-            const float blendFactor[4] = { 1, 1, 1, 1 };
-            vkCmdSetBlendConstants(list, blendFactor);
-            const VkViewport viewport{ 0, 0, float(kTargetWidth * g_scale), float(kTargetHeight * g_scale), 0, 1 };
-            vkCmdSetViewport(list, 0, 1, &viewport);
+            const uint32_t stencilReference = ReadRegister(reg::kStencilRefMask) & 0xFF;
+            if (recorded_.stencilReference != stencilReference)
+            {
+                vkCmdSetStencilReference(list, VK_STENCIL_FACE_FRONT_AND_BACK, stencilReference);
+                recorded_.stencilReference = stencilReference;
+            }
+            if (recorded_.commands != list)
+            {
+                const float blendFactor[4] = { 1, 1, 1, 1 };
+                vkCmdSetBlendConstants(list, blendFactor);
+                const VkViewport viewport{ 0, 0, float(kTargetWidth * g_scale), float(kTargetHeight * g_scale), 0, 1 };
+                vkCmdSetViewport(list, 0, 1, &viewport);
+                recorded_.commands = list;
+            }
             const uint32_t tl = ReadRegister(reg::kWindowScissorTl), br = ReadRegister(reg::kWindowScissorBr);
             int32_t left = int32_t(tl & 0x7FFF), top = int32_t((tl >> 16) & 0x7FFF);
             int32_t right = int32_t(std::min<uint32_t>(br & 0x7FFF, kTargetWidth)), bottom = int32_t(std::min<uint32_t>((br >> 16) & 0x7FFF, kTargetHeight));
@@ -2112,7 +2234,11 @@ namespace hc09::gpu
                 left = top = right = bottom = 0;
             const VkRect2D scissor{ { left * int32_t(g_scale), top * int32_t(g_scale) },
                 { uint32_t(right - left) * g_scale, uint32_t(bottom - top) * g_scale } };
-            vkCmdSetScissor(list, 0, 1, &scissor);
+            if (std::memcmp(&recorded_.scissor, &scissor, sizeof(scissor)) != 0)
+            {
+                vkCmdSetScissor(list, 0, 1, &scissor);
+                recorded_.scissor = scissor;
+            }
             if (indexed)
             {
                 vkCmdBindIndexBuffer(list, indexUpload.buffer, indexUpload.offset, VK_INDEX_TYPE_UINT32);

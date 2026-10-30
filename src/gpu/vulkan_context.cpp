@@ -22,7 +22,7 @@ namespace hc09::gpu
             return false;
         }
 
-        constexpr VkDeviceSize kChunkSize = 16ull << 20;
+        constexpr VkDeviceSize kChunkSize = 32ull << 20;  // (16 MB overflowed on game scenes: a new chunk mid-frame)
 
         double SecondsSince(std::chrono::steady_clock::time_point start)
         {

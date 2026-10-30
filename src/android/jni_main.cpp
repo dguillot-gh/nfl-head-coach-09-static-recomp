@@ -206,6 +206,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_startGame(JN
     const std::string files = args->userData.substr(0, args->userData.find_last_of('/'));
     setenv("HC09_PIPELINE_CACHE", (files + "/vulkan_pipelines.bin").c_str(), 0);
     setenv("HC09_PIPELINE_LIST", (files + "/pipelines.txt").c_str(), 0);
+    // Shaders missing from the APK are saved here (microcode, as HC09_DUMP_SHADERS writes it) to be
+    // converted on the PC and added to the next build.
+    setenv("HC09_MISSING_SHADERS", (files + "/missing-shaders").c_str(), 0);
     // The recompiled code runs deep on the guest main thread; give it the stack a desktop main thread has.
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);

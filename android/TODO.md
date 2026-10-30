@@ -71,18 +71,30 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
       for 60 s no longer holds the game. If it comes back: `VK_EXT_graphics_pipeline_library` on the Pixel.
 - [x] V30 freeze at "Select Favorite Team" (2026-10-30): malformed indirect buffers, then WAIT_REG_MEM
       stalled. ARM memory ordering: sync/lwsync/eieio were no-ops; now fences (recompiler patch + CP).
-- [ ] V30 driver refuses ps C0DEA8AD11DC6C29 (VK_INCOMPLETE; ~79 draws/frame skipped on Coach Now), down
-      from 11 refused pairs before the forward-only translation. The V30's Coach Now looks tinted blue next
-      to the Pixel's: likely those missing draws (a lighting pass?) or a colour/format issue on Adreno.
 - [x] Coach Now frame time (2026-10-30): the command-processor thread (the whole renderer) sat on a little
       core while the title's spinning job threads held the big ones, ~35-40 us per draw. It now keeps to the
       faster clusters (`HC09_CP_FAST_CORES=0` turns that off): Pixel 8 14 -> 19 fps, V30 12 -> 19 fps.
       `HC09_GPU_STATS` prints ms/frame per Draw phase, acquire/submit/present/fence waits and GPU time.
-- [ ] Coach Now is still CPU-bound on the renderer thread (~30 ms/frame Pixel, ~40 ms V30, for ~1,550 draws):
-      next are the per-draw costs (textures, record, setup, constants), and the title's job threads 0x150-0x15C
-      spinning on NtYieldExecution / zero KeDelayExecutionThread (~95% of a big core each).
-- [ ] V30: pipelines fail to build at random (VK_INCOMPLETE, 2-10 pairs per run, different each run), so
-      Coach Now skips 0-630 draws depending on the run. Retry failed pairs later instead of never.
+- [x] Job threads 0x150-0x15C spinning on NtYieldExecution / zero KeDelayExecutionThread (~95% of a big core
+      each): on Android a thread yielding >16 times in 1 ms sleeps 100 us (`HC09_YIELD_SLEEP_US`). Per-draw
+      cuts (texture/sampler memo per fetch slot, redundant dynamic state skipped, scratch vectors): Pixel
+      Coach Now 18.8 -> 27-28 fps (2026-10-30).
+- [x] Shaders missing from the APK are saved on the phone (`files/missing-shaders`, pull with
+      `adb exec-out run-as com.hc09.recomp cat files/missing-shaders/<f>`), converted with XenosToHlsl +
+      shaders_to_spirv.py: 152 shaders now; the Pixel draws a whole game with 0 skipped draws.
+- [ ] In a game the Pixel runs 13-20 fps (~33-36 ms renderer CPU, GPU ~20-23 ms): textures 9-10 ms (hashing
+      / CPU untiling), setup 7-8 (index conversion), vertices 6-7 (byte-swapped copies). GPU paths next.
+- [ ] V30 refuses pipelines: Adreno's log says "Bind group info mismatches the shader source for symbol
+      texture2_2d" (also texture6, FloatConstants, ...). Bindings are now visible only to the stages that
+      declare them (fixed C0DEA8AD11DC6C29 and 51ADA21A38FAF13D on Coach Now), but ~15 pairs still fail in a
+      game; the fallback slots (t48+, `textureN_2d`) are the prime suspect.
+- [ ] V30 GPU hang going from the menus into a game (frame ~3000-3300, as a burst of new pipelines first
+      draws): every submit fails after it (IOCTL_KGSL_GPU_COMMAND "Resource deadlock"). Not ps
+      E44B4D4FF40B0260 alone (skipping it still hangs). Bisect that scene's draws (HC09_SKIP_SHADERS / SKIP_DRAWS).
+- [ ] V30 3D geometry explodes in a game (spikes and slabs) where the Pixel draws the same meshes fine:
+      vertex fetch / skinning on Adreno (the Adreno 5xx SPIR-V rewrites? bone indexing into b0?). Turf shows a
+      criss-cross pattern. Needs a frame dump.
+- [ ] Pixel: flat black arms/hands and a grey head seen once on the sideline (texture or format mapping).
 - [ ] Per-device profiles (V30 vs Pixel 8) and an FPS counter option.
 - [ ] Logs and crash reports to `Android/data/<pkg>/files/logs` (stack traces via unwind).
 - [ ] Keep HC09's debug switches usable on Android (`HC09_PRESS` scripted input, fence/stack tracing)

@@ -4,7 +4,10 @@
 #include <windows.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <thread>
 
@@ -16,6 +19,34 @@ namespace hc09
 {
     namespace
     {
+        // A guest thread giving up its time slice. The title's job threads spin on this while they wait
+        // for work, which costs nothing on the console's six hardware threads but holds three of a
+        // phone's fast cores (Coach Now, ~95% each). On Android a thread that yields more than 16 times
+        // within 1 ms sleeps briefly instead. HC09_YIELD_SLEEP_US=<n> sets the sleep (100; 0: always yield).
+        void GuestYield()
+        {
+#if defined(__ANDROID__)
+            static const int sleepMicroseconds = [] {
+                const char* value = std::getenv("HC09_YIELD_SLEEP_US");
+                return value ? std::max(std::atoi(value), 0) : 100;
+            }();
+            thread_local std::chrono::steady_clock::time_point windowStart;
+            thread_local int yields = 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - windowStart > std::chrono::milliseconds(1))
+            {
+                windowStart = now;
+                yields = 0;
+            }
+            if (sleepMicroseconds > 0 && ++yields > 16)
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(sleepMicroseconds));
+                return;
+            }
+#endif
+            std::this_thread::yield();
+        }
+
         constexpr uint32_t kCreateSuspended = 0x1;
         constexpr uint32_t kDispatcherSignalState = 0x04;
         constexpr uint32_t kKthreadExitStatus = 0x140;
@@ -207,16 +238,16 @@ PPC_FUNC(__imp__KeDelayExecutionThread)
 {
     // (processor_mode, alertable, interval)
     const auto deadline = GuestTimeout(Arg32(ctx, 2));
-    if (deadline)
+    if (deadline && *deadline > std::chrono::steady_clock::now())
         std::this_thread::sleep_until(*deadline);
     else
-        std::this_thread::yield();
+        GuestYield();  // no interval (or zero): give up the time slice
     Return(ctx, status::kSuccess);
 }
 
 PPC_FUNC(__imp__NtYieldExecution)
 {
-    std::this_thread::yield();
+    GuestYield();
     Return(ctx, 0);
 }
 
