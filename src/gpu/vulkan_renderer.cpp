@@ -1725,10 +1725,20 @@ namespace hc09::gpu
         void Renderer::Resolve()
         {
             ResolveCopy();
-            // The frame's work so far goes to the GPU: a frame of many full-screen passes (the title's
-            // blur chain, resolved after each pass) in one submission makes the V30's driver give up.
-            EndPass();
-            context_.Submit();
+            // On Adreno (the V30) the frame's work so far goes to the GPU: a frame of many full-screen
+            // passes (the title's blur chain, resolved after each pass) in one submission makes its
+            // driver give up. Elsewhere the extra submissions only cost time (Pixel 8 title: ~23 fps with
+            // them, ~28 without, on a warm phone).
+            // HC09_SPLIT_SUBMITS=0/1 overrides.
+            static const bool split = [this] {
+                const char* value = std::getenv("HC09_SPLIT_SUBMITS");
+                return value ? std::atoi(value) != 0 : context_.properties().vendorID == 0x5143;  // Qualcomm
+            }();
+            if (split)
+            {
+                EndPass();
+                context_.Submit();
+            }
         }
 
         void Renderer::ResolveCopy()
