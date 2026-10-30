@@ -11,6 +11,7 @@ import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -33,9 +34,13 @@ public class LauncherActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER);
-        root.setBackgroundColor(Color.rgb(16, 32, 20));
+        root.setBackgroundResource(R.drawable.launcher_field);
         int pad = dp(24);
         root.setPadding(pad, pad, pad, pad);
+
+        ImageView ball = new ImageView(this);
+        ball.setImageResource(R.drawable.football);
+        root.addView(ball, new LinearLayout.LayoutParams(dp(96), dp(96)));
 
         TextView title = new TextView(this);
         title.setText("NFL Head Coach 09");
@@ -91,9 +96,15 @@ public class LauncherActivity extends Activity {
     }
 
     private void refresh() {
+        // The same choice GameActivity makes: the picked image, else HC09.iso in the app's files folder.
         String uri = prefs().getString(KEY_ISO_URI, null);
-        status.setText(uri == null ? "No disc image selected (Play opens the graphics test)."
-                                   : "Disc image: " + displayName(Uri.parse(uri)));
+        java.io.File local = new java.io.File(getExternalFilesDir(null), "HC09.iso");
+        if (uri != null)
+            status.setText("Disc image: " + displayName(Uri.parse(uri)));
+        else if (local.isFile())
+            status.setText("Disc image: HC09.iso (app folder)");
+        else
+            status.setText("No disc image selected (Play opens the graphics test).");
     }
 
     private String displayName(Uri uri) {

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- An American football, tilted, with end stripes and laces. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="-30">
+        <!-- Ball -->
+        <path
+            android:fillColor="#8A4520"
+            android:strokeColor="#4E2510"
+            android:strokeWidth="2.5"
+            android:pathData="M14,54 C28,26 80,26 94,54 C80,82 28,82 14,54 Z" />
+        <!-- Highlight -->
+        <path
+            android:fillColor="#A0582C"
+            android:pathData="M24,48 C36,33 72,33 84,48 C70,40 38,40 24,48 Z" />
+        <!-- End stripes -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="3"
+            android:strokeLineCap="round"
+            android:pathData="M28,41 C26,49 26,59 28,67" />
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="3"
+            android:strokeLineCap="round"
+            android:pathData="M80,41 C82,49 82,59 80,67" />
+        <!-- Laces -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2.5"
+            android:strokeLineCap="round"
+            android:pathData="M41,54 L67,54" />
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2.5"
+            android:strokeLineCap="round"
+            android:pathData="M44,49.5 L44,58.5 M49,49.5 L49,58.5 M54,49.5 L54,58.5 M59,49.5 L59,58.5 M64,49.5 L64,58.5" />
+    </group>
+</vector>

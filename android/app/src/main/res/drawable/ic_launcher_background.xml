@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon background: turf with two yard lines. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#2E6B2F"
+        android:pathData="M0,0 H108 V108 H0 Z" />
+    <path
+        android:fillColor="#357A36"
+        android:pathData="M0,0 H27 V108 H0 Z M54,0 H81 V108 H54 Z" />
+    <path
+        android:fillColor="#D8E8D0"
+        android:pathData="M26,0 H28 V108 H26 Z M80,0 H82 V108 H80 Z" />
+</vector>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher background: a strip of football field (alternating turf, yard lines, hash marks). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="160dp"
+    android:viewportWidth="320"
+    android:viewportHeight="160">
+    <path
+        android:fillColor="#1F4D22"
+        android:pathData="M0,0 H320 V160 H0 Z" />
+    <path
+        android:fillColor="#24582A"
+        android:pathData="M0,0 H40 V160 H0 Z M80,0 H120 V160 H80 Z M160,0 H200 V160 H160 Z M240,0 H280 V160 H240 Z" />
+    <path
+        android:fillColor="#5C8A5E"
+        android:pathData="M39,0 H41 V160 H39 Z M79,0 H81 V160 H79 Z M119,0 H121 V160 H119 Z M159,0 H161 V160 H159 Z M199,0 H201 V160 H199 Z M239,0 H241 V160 H239 Z M279,0 H281 V160 H279 Z" />
+    <path
+        android:fillColor="#5C8A5E"
+        android:pathData="M48,52 h1 v4 h-1 z M56,52 h1 v4 h-1 z M64,52 h1 v4 h-1 z M72,52 h1 v4 h-1 z M128,52 h1 v4 h-1 z M136,52 h1 v4 h-1 z M144,52 h1 v4 h-1 z M152,52 h1 v4 h-1 z M208,52 h1 v4 h-1 z M216,52 h1 v4 h-1 z M224,52 h1 v4 h-1 z M232,52 h1 v4 h-1 z M48,104 h1 v4 h-1 z M56,104 h1 v4 h-1 z M64,104 h1 v4 h-1 z M72,104 h1 v4 h-1 z M128,104 h1 v4 h-1 z M136,104 h1 v4 h-1 z M144,104 h1 v4 h-1 z M152,104 h1 v4 h-1 z M208,104 h1 v4 h-1 z M216,104 h1 v4 h-1 z M224,104 h1 v4 h-1 z M232,104 h1 v4 h-1 z" />
+</vector>
