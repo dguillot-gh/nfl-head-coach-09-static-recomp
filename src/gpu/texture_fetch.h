@@ -1,0 +1,46 @@
+#pragma once
+
+// Texture fetch constants (shared by the D3D12 and Vulkan texture caches).
+
+#include <cstdint>
+
+namespace hc09::gpu
+{
+    // Decoded texture fetch constant (6 dwords at 0x4800 + 6n).
+    struct TextureFetch
+    {
+        uint32_t words[6];
+
+        uint32_t type() const { return words[0] & 3; }
+        uint32_t clampX() const { return (words[0] >> 10) & 7; }
+        uint32_t clampY() const { return (words[0] >> 13) & 7; }
+        uint32_t clampZ() const { return (words[0] >> 16) & 7; }
+        uint32_t pitchTexels() const { return ((words[0] >> 22) & 0x1FF) * 32; }
+        bool tiled() const { return (words[0] >> 31) != 0; }
+        uint32_t format() const { return words[1] & 0x3F; }
+        uint32_t endian() const { return (words[1] >> 6) & 3; }
+        uint32_t baseAddress() const { return words[1] & 0xFFFFF000; }  // physical
+        bool stacked() const { return (words[1] >> 10) & 1; }                // 2D texture array
+        uint32_t stackDepth() const { return (words[2] >> 26) + 1; }        // layers of a stacked texture
+        uint32_t width() const { return (words[2] & 0x1FFF) + 1; }      // 2D
+        uint32_t height() const { return ((words[2] >> 13) & 0x1FFF) + 1; }
+        uint32_t width3D() const { return (words[2] & 0x7FF) + 1; }          // 3D: 11/11/10 bits
+        uint32_t height3D() const { return ((words[2] >> 11) & 0x7FF) + 1; }
+        uint32_t depth3D() const { return ((words[2] >> 22) & 0x3FF) + 1; }
+        uint32_t swizzle() const { return (words[3] >> 1) & 0xFFF; }    // 3 bits per channel
+        uint32_t magFilter() const { return (words[3] >> 19) & 3; }
+        uint32_t minFilter() const { return (words[3] >> 21) & 3; }
+        uint32_t mipFilter() const { return (words[3] >> 23) & 3; }
+        uint32_t anisoFilter() const { return (words[3] >> 25) & 7; }  // 0 off, n: up to 2^(n-1):1
+        uint32_t mipMinLevel() const { return (words[4] >> 2) & 0xF; }
+        uint32_t mipMaxLevel() const { return (words[4] >> 6) & 0xF; }
+        // Bits 10-11 are the mag/min anisotropic walk flags; the signed bias (1/32 steps) is bits 12-21.
+        int32_t lodBias() const { return int32_t(words[4] << 10) >> 22; }
+        bool packedMips() const { return (words[5] >> 11) & 1; }        // small levels share one tile
+        uint32_t borderColor() const { return words[5] & 3; }           // 0 transparent black, 1 white, 2/3 opaque black
+        uint32_t mipAddress() const { return words[5] & 0xFFFFF000; }   // physical; levels 1..n
+        uint32_t dimension() const { return (words[5] >> 9) & 3; }      // 0 1D, 1 2D, 2 3D, 3 cube
+    };
+
+    TextureFetch ReadTextureFetch(uint32_t index);
+}

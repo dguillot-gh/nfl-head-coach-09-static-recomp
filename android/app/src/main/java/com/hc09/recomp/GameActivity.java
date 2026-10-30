@@ -29,6 +29,7 @@ public class GameActivity extends Activity implements SurfaceHolder.Callback {
         view.getHolder().addCallback(this);
         setContentView(view);
         hideSystemBars();
+        NativeBridge.setAssetManager(getAssets());
         startGameIfPossible();
     }
 

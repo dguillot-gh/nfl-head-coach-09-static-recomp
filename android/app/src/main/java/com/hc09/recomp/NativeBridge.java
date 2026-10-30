@@ -1,5 +1,6 @@
 package com.hc09.recomp;
 
+import android.content.res.AssetManager;
 import android.view.Surface;
 
 /** JNI entry points of libhc09.so (src/android/jni_main.cpp). */
@@ -12,6 +13,9 @@ final class NativeBridge {
 
     /** Gives the renderer the window to present to (null when it goes away). */
     static native void setSurface(Surface surface);
+
+    /** Gives the native side the APK's assets (the renderer's shaders). Call before startGame. */
+    static native void setAssetManager(AssetManager assets);
 
     /** Boots the game on its own thread (once per process). */
     static native void startGame(String imagePath, String xexPath, String isoPath, String userDataPath);

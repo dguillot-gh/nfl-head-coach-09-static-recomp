@@ -1,10 +1,12 @@
-// JNI entry points of libhc09.so (com.hc09.recomp.NativeBridge) and the render thread.
+// JNI entry points of libhc09.so (com.hc09.recomp.NativeBridge), the render thread's test loop, and
+// the app services the host layer uses (android/app_glue.h).
 //
 // stdout/stderr go to logcat (tag HC09), so the host layer's existing logging shows up there.
-// Until the Vulkan renderer draws the game, the render thread clears the window to a colour that
-// cycles with the game's frame counter (or its own, when the game is not running): a visible sign
-// that presentation works and the game is alive.
+// Until the game's renderer takes the window over (at its first draw), the render thread clears it to
+// a colour that cycles with the game's frame counter (or its own, when the game is not running): a
+// visible sign that presentation works and the game is alive.
 
+#include <android/asset_manager_jni.h>
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
@@ -15,10 +17,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#include "android/app_glue.h"
 #include "gpu/draw.h"
 #include "gpu/vulkan_context.h"
 
@@ -69,10 +74,14 @@ namespace
 
     std::mutex g_windowMutex;
     std::condition_variable g_windowChanged;
-    ANativeWindow* g_pendingWindow = nullptr;  // owned reference, handed to the render thread
-    bool g_windowUpdate = false;
+    ANativeWindow* g_window = nullptr;  // owned reference to the current window (null: none)
+    uint64_t g_windowGeneration = 0;    // bumped at every setSurface
     bool g_renderThreadStarted = false;
+    bool g_takeOver = false;            // the renderer wants the window
+    bool g_renderThreadDone = false;    // ... and the test loop has let go of it
     std::atomic<bool> g_gameStarted{ false };
+    AAssetManager* g_assets = nullptr;
+    jobject g_assetsObject = nullptr;   // global reference keeping g_assets alive
 
     void HueToRgb(float hue, float& r, float& g, float& b)
     {
@@ -89,29 +98,31 @@ namespace
     void RenderThread()
     {
         hc09::gpu::VulkanContext context;
-        ANativeWindow* window = nullptr;
+        uint64_t generation = 0;
+        bool haveWindow = false;
         uint64_t frames = 0;
         for (;;)
         {
             {
                 std::unique_lock lock(g_windowMutex);
-                if (!window && !g_windowUpdate)
-                    g_windowChanged.wait(lock, [] { return g_windowUpdate; });
-                if (g_windowUpdate)
+                if (!haveWindow)
+                    g_windowChanged.wait(lock, [&] { return g_takeOver || g_windowGeneration != generation; });
+                if (g_takeOver)
                 {
-                    g_windowUpdate = false;
-                    if (window)
-                    {
-                        context.ReleaseWindow();
-                        ANativeWindow_release(window);
-                    }
-                    window = g_pendingWindow;
-                    g_pendingWindow = nullptr;
-                    if (window && !context.Initialize(window))
+                    context.Shutdown();
+                    g_renderThreadDone = true;
+                    g_windowChanged.notify_all();
+                    return;
+                }
+                if (g_windowGeneration != generation)
+                {
+                    generation = g_windowGeneration;
+                    haveWindow = g_window != nullptr;
+                    if (!context.Initialize(g_window))
                         __android_log_write(ANDROID_LOG_ERROR, kTag, "Vulkan initialization failed");
                 }
             }
-            if (!window)
+            if (!haveWindow)
                 continue;
             const int gameFrame = g_gameStarted ? hc09::gpu::FrameNumber() : 0;
             const uint64_t tick = g_gameStarted ? uint64_t(gameFrame) : frames;
@@ -121,6 +132,24 @@ namespace
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
             if (++frames % 600 == 0)
                 std::fprintf(stderr, "[render] %llu frames presented (game frame %d)\n", (unsigned long long)frames, gameFrame);
+        }
+    }
+
+    // KEY=VALUE lines of env.txt next to the game files: debug and test options (HC09_PRESS, ...).
+    void LoadEnvironment(const std::string& imagePath)
+    {
+        const std::string folder = imagePath.substr(0, imagePath.find_last_of('/') + 1);
+        std::ifstream file(folder + "env.txt");
+        std::string line;
+        while (std::getline(file, line))
+        {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                line.pop_back();
+            const size_t equals = line.find('=');
+            if (line.empty() || line[0] == '#' || equals == std::string::npos)
+                continue;
+            setenv(line.substr(0, equals).c_str(), line.substr(equals + 1).c_str(), 1);
+            std::fprintf(stderr, "[boot] env.txt: %s\n", line.c_str());
         }
     }
 
@@ -145,11 +174,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_setSurface(J
 {
     ANativeWindow* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
     std::lock_guard lock(g_windowMutex);
-    if (g_pendingWindow)
-        ANativeWindow_release(g_pendingWindow);
-    g_pendingWindow = window;
-    g_windowUpdate = true;
-    if (!g_renderThreadStarted)
+    if (g_window)
+        ANativeWindow_release(g_window);
+    g_window = window;
+    g_windowGeneration++;
+    if (!g_renderThreadStarted && !g_takeOver)
     {
         g_renderThreadStarted = true;
         std::thread(RenderThread).detach();
@@ -167,6 +196,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_startGame(JN
         std::string image, xex, iso, userData;
     };
     auto* args = new Args{ JavaString(env, image), JavaString(env, xex), JavaString(env, iso), JavaString(env, userData) };
+    LoadEnvironment(args->image);
     // The recompiled code runs deep on the guest main thread; give it the stack a desktop main thread has.
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
@@ -181,4 +211,41 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_startGame(JN
         return nullptr;
     }, args);
     pthread_attr_destroy(&attributes);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_setAssetManager(JNIEnv* env, jclass, jobject assets)
+{
+    if (g_assetsObject)
+        return;
+    g_assetsObject = env->NewGlobalRef(assets);
+    g_assets = AAssetManager_fromJava(env, g_assetsObject);
+}
+
+namespace hc09::android
+{
+    AAssetManager* Assets()
+    {
+        return g_assets;
+    }
+
+    void TakeOverWindow()
+    {
+        std::unique_lock lock(g_windowMutex);
+        g_takeOver = true;
+        g_windowChanged.notify_all();
+        if (g_renderThreadStarted)
+            g_windowChanged.wait(lock, [] { return g_renderThreadDone; });
+    }
+
+    bool PollWindow(uint64_t& generation, ANativeWindow*& window)
+    {
+        std::lock_guard lock(g_windowMutex);
+        if (generation == g_windowGeneration)
+            return false;
+        generation = g_windowGeneration;
+        window = g_window;
+        if (window)
+            ANativeWindow_acquire(window);
+        return true;
+    }
 }

@@ -47,7 +47,26 @@ android {
         }
     }
 
+    // The game's shaders as SPIR-V (assets/shaders/<microcode hash>.<vs|ps>.spv), built from the
+    // captured microcode by tools/shaders_to_spirv.py into build/shaders-spirv. Derived from the
+    // game, so never committed: each local build copies them in.
+    sourceSets {
+        main {
+            assets.srcDirs += ["$buildDir/generated/hc09Assets"]
+        }
+    }
+    androidResources {
+        noCompress 'spv'
+    }
+
     lint {
         abortOnError false
     }
 }
+
+tasks.register('copyShaders', Copy) {
+    from "${rootDir}/../build/shaders-spirv"
+    include '*.spv'
+    into "$buildDir/generated/hc09Assets/shaders"
+}
+preBuild.dependsOn 'copyShaders'
