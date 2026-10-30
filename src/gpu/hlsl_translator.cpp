@@ -121,6 +121,8 @@ uint StreamOffset(uint stream)
 
                 if (IsStraightLine())
                     EmitStraightLine();
+                else if (IsForwardOnly())
+                    EmitForwardOnly();
                 else
                     EmitStateMachine();
                 if (!result_.error.empty())
@@ -178,6 +180,67 @@ uint StreamOffset(uint stream)
                 }
             }
 
+            // Conditional execs and jumps that only go forward (no loops, calls or returns): most shaders
+            // that are not straight-line.
+            bool IsForwardOnly() const
+            {
+                for (uint32_t index = 0; index < program_.size(); index++)
+                {
+                    const auto& cf = program_[index];
+                    switch (cf.opcode())
+                    {
+                    case CfOpcode::Nop:
+                    case CfOpcode::Exec:
+                    case CfOpcode::ExecEnd:
+                    case CfOpcode::CondExec:
+                    case CfOpcode::CondExecEnd:
+                    case CfOpcode::CondExecPredClean:
+                    case CfOpcode::CondExecPredCleanEnd:
+                    case CfOpcode::CondPredExec:
+                    case CfOpcode::CondPredExecEnd:
+                    case CfOpcode::Alloc:
+                    case CfOpcode::MarkVsFetchDone:
+                        break;
+                    case CfOpcode::CondJmp:
+                        if (cf.targetAddress() <= index)
+                            return false;
+                        break;
+                    default:
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // The state machine's cases in order, each run when pc has reached it. With every jump going
+            // forward one pass runs them all, so there is no loop or switch: GPU compilers struggle with
+            // those (the Pixel 8's took over 50 minutes on some shaders), while this is plain uniform ifs.
+            void EmitForwardOnly()
+            {
+                Line("int pc = 0;");
+                for (uint32_t index = 0; index < program_.size(); index++)
+                {
+                    const auto& cf = program_[index];
+                    const int next = cf.IsEnd() ? -1 : int(index + 1);
+                    Line(Format("if (pc == %u)", index));
+                    Line("{");
+                    indent_++;
+                    if (cf.opcode() == CfOpcode::CondJmp)
+                    {
+                        if (cf.isUnconditional())
+                            Line(Format("pc = %u;", cf.targetAddress()));
+                        else
+                            Line(Format("pc = (%s) ? %u : %d;", ConditionExpression(cf, cf.isPredicated()).c_str(), cf.targetAddress(), next));
+                    }
+                    else
+                    {
+                        EmitControlFlowCase(cf, index, next, false);
+                    }
+                    indent_--;
+                    Line("}");
+                }
+            }
+
             void EmitStateMachine()
             {
                 Line("int pc = 0;");
@@ -220,7 +283,8 @@ uint StreamOffset(uint stream)
                 return Format("BoolConstant(%u) == %s", cf.boolAddress(), cf.condition() ? "true" : "false");
             }
 
-            void EmitControlFlowCase(const CfInstruction& cf, uint32_t index, int next)
+            // dispatch: end the case by setting pc and leaving the switch (false: the caller sets pc).
+            void EmitControlFlowCase(const CfInstruction& cf, uint32_t index, int next, bool dispatch = true)
             {
                 switch (cf.opcode())
                 {
@@ -289,7 +353,8 @@ uint StreamOffset(uint stream)
                 }
                 (void)index;
                 Line(Format("pc = %d;", next));
-                Line("break;");
+                if (dispatch)
+                    Line("break;");
             }
 
             void EmitExecBody(const CfInstruction& cf)

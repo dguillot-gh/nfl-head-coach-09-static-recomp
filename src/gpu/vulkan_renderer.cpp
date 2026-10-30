@@ -1327,12 +1327,16 @@ namespace hc09::gpu
                 std::atomic<size_t> next{ 0 }, built{ 0 }, failed{ 0 };
                 std::atomic<int> running{ kWorkers };
                 std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+                std::atomic<size_t> building[kWorkers];  // list index each worker is on (SIZE_MAX: none)
+                std::mutex mutex;
+                std::condition_variable progress;  // a pipeline finished
             };
             auto shared = std::make_shared<Shared>();
             shared->list = std::move(list);
             g_precompileTotal = int(shared->list.size());
             g_precompileDone = 0;
-            std::vector<std::thread> workers;
+            for (auto& index : shared->building)
+                index = SIZE_MAX;
             const VkDevice device = this->device();
             const VkPipelineCache cache = context_.pipelineCache();
             const VkShaderModule gs = rectangleGs_;
@@ -1341,7 +1345,7 @@ namespace hc09::gpu
             VulkanContext* context = &context_;
             for (int worker = 0; worker < kWorkers; worker++)
             {
-                workers.emplace_back([=] {
+                std::thread([=] {
                     // Each worker loads its own shader modules (by hash) and makes its own layouts and passes.
                     std::unordered_map<uint64_t, std::pair<VkShaderModule, std::vector<uint32_t>>> modules;
                     auto module = [&](uint64_t hash, bool pixel) -> std::pair<VkShaderModule, std::vector<uint32_t>>* {
@@ -1371,8 +1375,10 @@ namespace hc09::gpu
                         if (!vs || !ps || (desc.rectangles && !gs))
                         {
                             g_precompileDone++;
+                            shared->progress.notify_all();
                             continue;
                         }
+                        shared->building[worker] = i;
                         // The same set layout as GetShaderPair makes (pipeline layouts only need to match).
                         std::set<uint32_t> bindings(vs->second.begin(), vs->second.end());
                         bindings.insert(ps->second.begin(), ps->second.end());
@@ -1412,7 +1418,9 @@ namespace hc09::gpu
                             vkDestroyRenderPass(device, pass, nullptr);
                         vkDestroyPipelineLayout(device, layout, nullptr);
                         vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+                        shared->building[worker] = SIZE_MAX;
                         g_precompileDone++;
+                        shared->progress.notify_all();
                     }
                     for (auto& [key, entry] : modules)
                         vkDestroyShaderModule(device, entry.first, nullptr);
@@ -1423,10 +1431,27 @@ namespace hc09::gpu
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - shared->start).count());
                         context->SavePipelineCache();
                     }
-                });
+                }).detach();
             }
-            for (std::thread& worker : workers)
-                worker.join();
+            // The game waits until every pipeline is done, or until none has finished for a while: the
+            // Pixel 8's compiler has spent over 50 minutes on a single pipeline. Those keep building in
+            // the background (the workers outlive this), and the game skips their draws until then.
+            constexpr auto kStallLimit = std::chrono::seconds(60);
+            {
+                std::unique_lock lock(shared->mutex);
+                for (int done = g_precompileDone; done < g_precompileTotal; done = g_precompileDone)
+                    if (!shared->progress.wait_for(lock, kStallLimit, [&] { return g_precompileDone != done; }))
+                        break;
+            }
+            if (g_precompileDone < g_precompileTotal)
+            {
+                std::fprintf(stderr, "[gpu] pre-compile: no pipeline finished for %lld s, starting with %d of %d; still building:\n",
+                    (long long)kStallLimit.count(), int(g_precompileDone), int(g_precompileTotal));
+                for (const auto& index : shared->building)
+                    if (const size_t i = index; i != SIZE_MAX)
+                        std::fprintf(stderr, "[gpu]   vs %016llX ps %016llX\n", (unsigned long long)shared->list[i].vs,
+                            (unsigned long long)shared->list[i].ps);
+            }
             g_precompileTotal = 0;
         }
 

@@ -65,21 +65,15 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
 
 ## Performance and diagnostics
 
-- [ ] **Faster pipeline compiling on the Pixel 8** (the first "Preparing shaders" pass took 20+ min: a few
-      pixel shaders take Mali 25-45 s each, e.g. C0DEA8AD11DC6C29.ps and 51ADA21A38FAF13D.ps, and are
-      compiled again for every vertex shader / render state they pair with):
-      1. Quick: more pre-compile workers in `StartPrecompile` (4 -> 8; the game is paused meanwhile, and the
-         Pixel has 9 cores).
-      2. Big win, Pixel only: `VK_EXT_graphics_pipeline_library` (compile each shader stage once, link
-         pipelines cheaply) and/or extended dynamic state (blend, depth/stencil, cull dynamic), so those
-         shaders compile once instead of per pipeline. The V30 (Vulkan 1.0) keeps the current path.
-      3. Long term: smaller translated pixel shaders from the translator (unrolling the register init,
-         spirv-opt -O and dropping the Adreno 5xx rewrites were measured on 2026-10-30: no gain).
+- [x] **Pipeline compiling on the Pixel 8**: 31 shaders were translated as a `while (pc) switch (pc)` loop
+      that Mali's compiler spent up to 50+ min on. All their jumps go forward, so the translator now writes
+      them as plain ifs: the whole pre-compile takes 5 s (2026-10-30). A pipeline stalling the pre-compile
+      for 60 s no longer holds the game. If it comes back: `VK_EXT_graphics_pipeline_library` on the Pixel.
 - [x] V30 freeze at "Select Favorite Team" (2026-10-30): malformed indirect buffers, then WAIT_REG_MEM
       stalled. ARM memory ordering: sync/lwsync/eieio were no-ops; now fences (recompiler patch + CP).
-- [ ] V30 driver refuses 9+ pipelines with VK_INCOMPLETE on the menus (Coach Now: sky and ground black;
-      up to ~700 draws/frame skipped). Not size-related (7 KB shaders fail, 85 KB ones build), e.g.
-      ps C6100068E4666E5A, 05477D5BC59B1C6F, C0DEA8AD11DC6C29. Find which construct the driver dislikes.
+- [ ] V30 driver refuses ps C0DEA8AD11DC6C29 (VK_INCOMPLETE; ~79 draws/frame skipped on Coach Now), down
+      from 11 refused pairs before the forward-only translation. The V30's Coach Now looks tinted blue next
+      to the Pixel's: likely those missing draws (a lighting pass?) or a colour/format issue on Adreno.
 - [ ] Per-device profiles (V30 vs Pixel 8) and an FPS counter option.
 - [ ] Logs and crash reports to `Android/data/<pkg>/files/logs` (stack traces via unwind).
 - [ ] Keep HC09's debug switches usable on Android (`HC09_PRESS` scripted input, fence/stack tracing)
