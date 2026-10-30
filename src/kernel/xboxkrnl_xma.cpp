@@ -32,10 +32,14 @@
 
 extern "C"
 {
+// HC09_NO_FFMPEG builds without the decoder (every packet decodes to silence), for hosts that
+// have no FFmpeg build yet.
+#ifndef HC09_NO_FFMPEG
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#endif
 }
 
 #include "debug/stack_dump.h"
@@ -112,9 +116,11 @@ namespace hc09
         // that has not been written to the output buffer yet.
         struct ContextState
         {
+#ifndef HC09_NO_FFMPEG
             AVCodecContext* codec = nullptr;
             AVPacket* packet = nullptr;
             AVFrame* frame = nullptr;
+#endif
             uint32_t channels = 0, sampleRate = 0;
             std::deque<int16_t> pcm;  // interleaved
             std::deque<uint64_t> recentHashes;  // diagnostics: hashes of recent decoded frames
@@ -128,6 +134,29 @@ namespace hc09
             ContextState& operator=(const ContextState&) = delete;
             ~ContextState() { Close(); }
 
+#ifdef HC09_NO_FFMPEG
+            void Close()
+            {
+                pcm.clear();
+            }
+
+            bool Open(uint32_t newChannels, uint32_t newRate)
+            {
+                if (channels != newChannels || sampleRate != newRate)
+                    Close();
+                channels = newChannels;
+                sampleRate = newRate;
+                return true;
+            }
+
+            // Silence for the packet's frames (512 samples each), so the title keeps streaming.
+            void Decode(const uint8_t* data)
+            {
+                g_counters.packets++;
+                const uint32_t frames = std::max<uint32_t>(data[0] >> 2, 1);
+                pcm.insert(pcm.end(), size_t(frames) * 512 * channels, int16_t(0));
+            }
+#else
             void Close()
             {
                 avcodec_free_context(&codec);
@@ -234,6 +263,7 @@ namespace hc09
                     av_frame_unref(frame);
                 }
             }
+#endif
         };
 
         std::mutex g_xmaMutex;

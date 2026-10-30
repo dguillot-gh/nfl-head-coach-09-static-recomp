@@ -1,10 +1,10 @@
 #include "kernel/vfs.h"
 
+#include "common/host_file.h"
 #include "kernel/guest.h"
 
-#include <windows.h>
-
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <map>
 #include <unordered_map>
@@ -48,11 +48,6 @@ namespace hc09
             return parts;
         }
 
-        uint64_t FileTimeValue(const FILETIME& ft)
-        {
-            return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-        }
-
         // ---- Disc image (XDVDFS) -------------------------------------------------------------
 
         struct DiscNode
@@ -69,9 +64,8 @@ namespace hc09
         public:
             bool Open(const std::filesystem::path& path)
             {
-                handle_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
-                if (handle_ == INVALID_HANDLE_VALUE)
+                file_ = host::FileHandle::Open(path, false, host::Creation::OpenExisting, true);
+                if (!file_.IsOpen())
                     return false;
 
                 // The game partition starts at 0 for extracted images; check the XGD offsets too.
@@ -94,13 +88,7 @@ namespace hc09
 
             uint32_t ReadAt(uint64_t offset, void* buffer, uint32_t length) const
             {
-                OVERLAPPED overlapped{};
-                overlapped.Offset = DWORD(offset);
-                overlapped.OffsetHigh = DWORD(offset >> 32);
-                DWORD read = 0;
-                if (!ReadFile(handle_, buffer, length, &read, &overlapped))
-                    return 0;
-                return read;
+                return file_.ReadAt(offset, buffer, length);
             }
 
             uint64_t SectorOffset(uint32_t sector) const { return partition_ + uint64_t(sector) * kSectorSize; }
@@ -163,7 +151,7 @@ namespace hc09
                 }
             }
 
-            HANDLE handle_ = INVALID_HANDLE_VALUE;
+            host::FileHandle file_;
             uint64_t partition_ = 0;
             DiscNode root_;
         };
@@ -226,13 +214,14 @@ namespace hc09
 
         // ---- Host directories ----------------------------------------------------------------
 
-        FileInfo HostInfo(const WIN32_FILE_ATTRIBUTE_DATA& data)
+        FileInfo HostInfo(const std::filesystem::path& path)
         {
+            const host::FileStat data = host::Stat(path);
             FileInfo info;
-            info.directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            info.size = info.directory ? 0 : (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-            info.creationTime = FileTimeValue(data.ftCreationTime);
-            info.writeTime = FileTimeValue(data.ftLastWriteTime);
+            info.directory = data.directory;
+            info.size = data.size;
+            info.creationTime = data.creationTime;
+            info.writeTime = data.writeTime;
             info.attributes = info.directory ? kAttributeDirectory : kAttributeNormal;
             return info;
         }
@@ -240,13 +229,14 @@ namespace hc09
         class HostFile : public File
         {
         public:
-            HostFile(HANDLE handle, std::filesystem::path path, bool writable)
-                : handle_(handle), path_(std::move(path)), writable_(writable) {}
+            HostFile(host::FileHandle file, std::filesystem::path path, bool writable)
+                : file_(std::move(file)), path_(std::move(path)), writable_(writable) {}
             ~HostFile() override
             {
-                CloseHandle(handle_);
+                file_.Close();
+                std::error_code ec;
                 if (deleteOnClose_)
-                    DeleteFileW(path_.c_str());
+                    std::filesystem::remove(path_, ec);
             }
 
             uint32_t SetDeleteOnClose(bool remove) override
@@ -257,40 +247,28 @@ namespace hc09
 
             FileInfo Info() const override
             {
-                WIN32_FILE_ATTRIBUTE_DATA data{};
-                GetFileAttributesExW(path_.c_str(), GetFileExInfoStandard, &data);
-                return HostInfo(data);
+                return HostInfo(path_);
             }
 
             uint32_t Read(uint64_t offset, void* buffer, uint32_t length) override
             {
-                OVERLAPPED overlapped{};
-                overlapped.Offset = DWORD(offset);
-                overlapped.OffsetHigh = DWORD(offset >> 32);
-                DWORD read = 0;
-                return ReadFile(handle_, buffer, length, &read, &overlapped) ? read : 0;
+                return file_.ReadAt(offset, buffer, length);
             }
 
             uint32_t Write(uint64_t offset, const void* buffer, uint32_t length) override
             {
-                OVERLAPPED overlapped{};
-                overlapped.Offset = DWORD(offset);
-                overlapped.OffsetHigh = DWORD(offset >> 32);
-                DWORD written = 0;
-                return WriteFile(handle_, buffer, length, &written, &overlapped) ? written : 0;
+                return file_.WriteAt(offset, buffer, length);
             }
 
             bool SetSize(uint64_t size) override
             {
-                FILE_END_OF_FILE_INFO info{};
-                info.EndOfFile.QuadPart = LONGLONG(size);
-                return SetFileInformationByHandle(handle_, FileEndOfFileInfo, &info, sizeof(info)) != 0;
+                return file_.SetSize(size);
             }
 
             bool Writable() const override { return writable_; }
 
         private:
-            HANDLE handle_;
+            host::FileHandle file_;
             std::filesystem::path path_;
             bool writable_;
             bool deleteOnClose_ = false;
@@ -304,8 +282,9 @@ namespace hc09
                 : path_(std::move(path).lexically_normal()), deviceRoot_(deviceRoot) {}
             ~HostDirectory() override
             {
+                std::error_code ec;
                 if (deleteOnClose_)
-                    RemoveDirectoryW(path_.c_str());
+                    std::filesystem::remove(path_, ec);
             }
 
             uint32_t SetDeleteOnClose(bool remove) override
@@ -321,9 +300,7 @@ namespace hc09
 
             FileInfo Info() const override
             {
-                WIN32_FILE_ATTRIBUTE_DATA data{};
-                GetFileAttributesExW(path_.c_str(), GetFileExInfoStandard, &data);
-                return HostInfo(data);
+                return HostInfo(path_);
             }
 
             uint32_t Read(uint64_t, void*, uint32_t) override { return 0; }
@@ -334,9 +311,7 @@ namespace hc09
                 std::error_code ec;
                 for (const auto& item : std::filesystem::directory_iterator(path_, ec))
                 {
-                    WIN32_FILE_ATTRIBUTE_DATA data{};
-                    GetFileAttributesExW(item.path().c_str(), GetFileExInfoStandard, &data);
-                    entries.push_back({ item.path().filename().string(), HostInfo(data) });
+                    entries.push_back({ item.path().filename().string(), HostInfo(item.path()) });
                 }
                 return entries;
             }
@@ -430,23 +405,23 @@ namespace hc09
                         path.lexically_normal() == device.hostRoot.lexically_normal())) };
             }
 
-            DWORD creation = OPEN_EXISTING;
+            host::Creation creation = host::Creation::OpenExisting;
             uint32_t information = 1;  // FILE_OPENED
             switch (disposition)
             {
-            case OpenDisposition::Open: creation = OPEN_EXISTING; break;
-            case OpenDisposition::Create: creation = CREATE_NEW; information = 2; break;
-            case OpenDisposition::OpenOrCreate: creation = OPEN_ALWAYS; information = exists ? 1 : 2; break;
-            case OpenDisposition::Overwrite: creation = TRUNCATE_EXISTING; information = 3; break;
-            case OpenDisposition::Supersede: creation = CREATE_ALWAYS; information = exists ? 3 : 2; break;
+            case OpenDisposition::Open: creation = host::Creation::OpenExisting; break;
+            case OpenDisposition::Create: creation = host::Creation::CreateNew; information = 2; break;
+            case OpenDisposition::OpenOrCreate: creation = host::Creation::OpenAlways; information = exists ? 1 : 2; break;
+            case OpenDisposition::Overwrite: creation = host::Creation::TruncateExisting; information = 3; break;
+            case OpenDisposition::Supersede: creation = host::Creation::CreateAlways; information = exists ? 3 : 2; break;
             }
             const bool writable = write || disposition != OpenDisposition::Open;
-            HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | (writable ? GENERIC_WRITE : 0),
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (handle == INVALID_HANDLE_VALUE)
-                return { GetLastError() == ERROR_PATH_NOT_FOUND ? status::kObjectPathNotFound : status::kAccessDenied };
+            host::OpenError error;
+            host::FileHandle file = host::FileHandle::Open(path, writable, creation, false, &error);
+            if (!file.IsOpen())
+                return { error == host::OpenError::PathNotFound ? status::kObjectPathNotFound : status::kAccessDenied };
             return { status::kSuccess, information,
-                std::make_shared<FileObject>(canonical, std::make_unique<HostFile>(handle, path, writable)) };
+                std::make_shared<FileObject>(canonical, std::make_unique<HostFile>(std::move(file), path, writable)) };
         }
     }
 

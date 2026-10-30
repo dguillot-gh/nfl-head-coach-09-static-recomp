@@ -7,6 +7,7 @@
 #include <fstream>
 #include <vector>
 
+#include "common/strings.h"
 #include "kernel/guest.h"
 #include "kernel/heap.h"
 
@@ -113,7 +114,7 @@ PPC_FUNC(__imp__XexGetModuleHandle)
     // xam.xex and xboxkrnl.exe are host code.
     const char* name = GuestCString(Arg32(ctx, 0));
     const uint32_t out = Arg32(ctx, 1);
-    if (name == nullptr || _stricmp(name, "default.xex") == 0)
+    if (name == nullptr || CompareNoCase(name, "default.xex") == 0)
     {
         Store<uint32_t>(out, g_module);
         return Return(ctx, status::kSuccess);

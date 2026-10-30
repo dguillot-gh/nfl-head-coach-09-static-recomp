@@ -1,6 +1,8 @@
 // Rtl*: critical sections, strings, memory helpers, time conversion.
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -11,6 +13,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/atomic_ref.h"
+#include "common/host_time.h"
 #include "kernel/guest.h"
 #include "kernel/threads.h"
 
@@ -50,9 +54,9 @@ namespace hc09
         constexpr uint32_t kOwner = 0x18;
         constexpr size_t kWaitShards = 64;
 
-        std::atomic_ref<uint32_t> GuestWord(uint32_t address)
+        AtomicRef<uint32_t> GuestWord(uint32_t address)
         {
-            return std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(GuestToHost(address)));
+            return AtomicRef<uint32_t>(*reinterpret_cast<uint32_t*>(GuestToHost(address)));
         }
 
         // Atomically adds `delta` to a big-endian guest int32; returns the new value.
@@ -282,10 +286,8 @@ PPC_FUNC(__imp__RtlTimeToTimeFields)
 {
     const uint64_t time = Load<uint64_t>(Arg32(ctx, 0));
     const uint32_t fields = Arg32(ctx, 1);
-    FILETIME ft{ DWORD(time), DWORD(time >> 32) };
-    SYSTEMTIME st{};
-    FileTimeToSystemTime(&ft, &st);
-    const uint16_t values[] = { st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, st.wDayOfWeek };
+    const host::TimeFields st = host::FileTimeToFields(time);
+    const uint16_t values[] = { st.year, st.month, st.day, st.hour, st.minute, st.second, st.milliseconds, st.weekday };
     for (int i = 0; i < 8; i++)
         Store<uint16_t>(fields + i * 2, values[i]);
 }
@@ -293,18 +295,18 @@ PPC_FUNC(__imp__RtlTimeToTimeFields)
 PPC_FUNC(__imp__RtlTimeFieldsToTime)
 {
     const uint32_t fields = Arg32(ctx, 0), out = Arg32(ctx, 1);
-    SYSTEMTIME st{};
-    st.wYear = Load<uint16_t>(fields + 0);
-    st.wMonth = Load<uint16_t>(fields + 2);
-    st.wDay = Load<uint16_t>(fields + 4);
-    st.wHour = Load<uint16_t>(fields + 6);
-    st.wMinute = Load<uint16_t>(fields + 8);
-    st.wSecond = Load<uint16_t>(fields + 10);
-    st.wMilliseconds = Load<uint16_t>(fields + 12);
-    FILETIME ft{};
-    if (!SystemTimeToFileTime(&st, &ft))
+    host::TimeFields st{};
+    st.year = Load<uint16_t>(fields + 0);
+    st.month = Load<uint16_t>(fields + 2);
+    st.day = Load<uint16_t>(fields + 4);
+    st.hour = Load<uint16_t>(fields + 6);
+    st.minute = Load<uint16_t>(fields + 8);
+    st.second = Load<uint16_t>(fields + 10);
+    st.milliseconds = Load<uint16_t>(fields + 12);
+    uint64_t time;
+    if (!host::FieldsToFileTime(st, time))
         return Return(ctx, 0);
-    Store<uint64_t>(out, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+    Store<uint64_t>(out, time);
     Return(ctx, 1);
 }
 

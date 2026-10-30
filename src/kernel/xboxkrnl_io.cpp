@@ -6,7 +6,9 @@
 #include <cstring>
 #include <vector>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "debug/stack_dump.h"
 #include "kernel/guest.h"
@@ -83,9 +85,7 @@ namespace hc09
             static const char* stackOnOpen = std::getenv("HC09_STACK_ON_OPEN");
             if (stackOnOpen && path.find(stackOnOpen) != std::string::npos)
             {
-                CONTEXT context{};
-                RtlCaptureContext(&context);
-                debug::PrintStackFromContext(&context);
+                debug::PrintCurrentStack();
             }
             if (result.object && (options & kFileDeleteOnClose))
                 result.object->file->SetDeleteOnClose(true);
@@ -188,9 +188,7 @@ PPC_FUNC(__imp__NtReadFile)
     static const char* stackOnRead = std::getenv("HC09_STACK_ON_READ");
     if (stackOnRead && offset == std::strtoull(stackOnRead, nullptr, 16))
     {
-        CONTEXT context{};
-        RtlCaptureContext(&context);
-        debug::PrintStackFromContext(&context);
+        debug::PrintCurrentStack();
     }
     CompleteIo(Arg32(ctx, 4), result, read, Arg32(ctx, 1));
     Return(ctx, result);

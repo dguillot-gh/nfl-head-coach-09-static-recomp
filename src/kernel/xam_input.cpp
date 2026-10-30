@@ -9,8 +9,7 @@
 //   - HC09_PRESS=<frame>:<button>[,<frame>:<button>...]: scripted presses (held for six
 //     frames), buttons named a b x y lb rb lt rt ls rs up down left right start back.
 
-#include <windows.h>
-#include <Xinput.h>
+#include "kernel/host_input.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -112,16 +111,26 @@ namespace hc09
             return presses;
         }
 
+        // The keyboard pad exists on Windows only; elsewhere the host app feeds the controller.
         bool GameWindowFocused()
         {
+#ifdef _WIN32
             DWORD process = 0;
             GetWindowThreadProcessId(GetForegroundWindow(), &process);
             return process == GetCurrentProcessId();
+#else
+            return false;
+#endif
         }
 
         bool KeyDown(int key)
         {
+#ifdef _WIN32
             return (GetAsyncKeyState(key) & 0x8000) != 0;
+#else
+            (void)key;
+            return false;
+#endif
         }
 
         int16_t Axis(int negative, int positive)

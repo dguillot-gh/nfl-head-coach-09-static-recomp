@@ -230,6 +230,13 @@ namespace hc09::debug
         std::fflush(stderr);
     }
 
+    void PrintCurrentStack()
+    {
+        CONTEXT context{};
+        RtlCaptureContext(&context);
+        PrintStackFromContext(&context);
+    }
+
     void DumpAllStacks()
     {
         const HANDLE process = GetCurrentProcess();

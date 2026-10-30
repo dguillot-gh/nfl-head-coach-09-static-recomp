@@ -14,6 +14,9 @@ namespace hc09::debug
     // Prints the call stack captured in `context` (for exception handlers).
     void PrintStackFromContext(const void* context);
 
+    // Prints the calling thread's own call stack.
+    void PrintCurrentStack();
+
     // If HC09_DUMP_STACKS=<seconds> is set, dumps all stacks after that delay.
     // If HC09_WATCH=<guest address>[,...] is set (up to 4), every guest thread gets a
     // hardware write breakpoint on those bytes; each write logs the value and the writer's stack.

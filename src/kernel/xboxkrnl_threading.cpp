@@ -1,6 +1,8 @@
 // Threads, waits, and synchronization objects (events, semaphores, mutants, timers).
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <condition_variable>
 #include <cstdio>

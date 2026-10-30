@@ -1,14 +1,13 @@
 // Process, TLS, time, IRQL/spinlock, debug and fatal-error functions.
 
-#include <windows.h>
-#include <intrin.h>
-
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 
+#include "common/atomic_ref.h"
+#include "common/host_time.h"
 #include "kernel/guest.h"
 #include "kernel/threads.h"
 
@@ -39,26 +38,13 @@ namespace hc09
 
     uint64_t HostTimestampFrequency()
     {
-        // mftb is recompiled to __rdtsc(), so guest timing must use the TSC rate.
-        static const uint64_t frequency = [] {
-            LARGE_INTEGER qpcFrequency, start, end;
-            QueryPerformanceFrequency(&qpcFrequency);
-            QueryPerformanceCounter(&start);
-            const uint64_t tscStart = __rdtsc();
-            do
-                QueryPerformanceCounter(&end);
-            while (end.QuadPart - start.QuadPart < qpcFrequency.QuadPart / 20);  // 50 ms
-            const uint64_t tscEnd = __rdtsc();
-            return (tscEnd - tscStart) * uint64_t(qpcFrequency.QuadPart) / uint64_t(end.QuadPart - start.QuadPart);
-        }();
-        return frequency;
+        // mftb is recompiled to __rdtsc(), so guest timing must use that counter's rate.
+        return host::TimebaseFrequency();
     }
 
     uint64_t SystemTime()
     {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        return host::SystemTimeFileTime();
     }
 
     // ---- IRQL, spinlocks, critical regions -----------------------------------------------------
@@ -67,9 +53,9 @@ namespace hc09
 
     namespace
     {
-        std::atomic_ref<uint32_t> GuestWord(uint32_t address)
+        AtomicRef<uint32_t> GuestWord(uint32_t address)
         {
-            return std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(GuestToHost(address)));
+            return AtomicRef<uint32_t>(*reinterpret_cast<uint32_t*>(GuestToHost(address)));
         }
 
         void AcquireSpinLock(uint32_t lock)
@@ -80,7 +66,7 @@ namespace hc09
             while (!word.compare_exchange_weak(expected, owner, std::memory_order_acquire))
             {
                 expected = 0;
-                YieldProcessor();
+                host::CpuRelax();
             }
         }
 

@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 
+#include "common/host_file.h"
 #include "kernel/guest.h"
 #include "kernel/objects.h"
 #include "kernel/vfs.h"
@@ -72,10 +73,16 @@ namespace hc09
             return TypeDirectory(data.contentType) / data.fileName;
         }
 
-        // Display names are kept beside the package directory.
+        // Display names are kept beside the package directory, in <package>.name.
+        std::filesystem::path NameFile(std::filesystem::path package)
+        {
+            package += ".name";
+            return package;
+        }
+
         void SaveDisplayName(const ContentData& data)
         {
-            FILE* file = _wfopen((PackageDirectory(data).wstring() + L".name").c_str(), L"wb");
+            FILE* file = host::OpenStdioFile(NameFile(PackageDirectory(data)), "wb");
             if (!file)
                 return;
             std::fwrite(data.displayName.data(), 2, data.displayName.size(), file);
@@ -85,7 +92,7 @@ namespace hc09
         std::u16string ReadDisplayName(const std::filesystem::path& package)
         {
             std::u16string name;
-            FILE* file = _wfopen((package.wstring() + L".name").c_str(), L"rb");
+            FILE* file = host::OpenStdioFile(NameFile(package), "rb");
             if (!file)
                 return name;
             char16_t c;
@@ -244,7 +251,7 @@ PPC_FUNC(__imp__XamContentDelete)
     const ContentData data = LoadContentData(Arg32(ctx, 1));
     std::error_code ec;
     std::filesystem::remove_all(PackageDirectory(data), ec);
-    std::filesystem::remove(PackageDirectory(data).wstring() + L".name", ec);
+    std::filesystem::remove(NameFile(PackageDirectory(data)), ec);
     Return(ctx, CompleteRequest(Arg32(ctx, 2), error::kSuccess));
 }
 

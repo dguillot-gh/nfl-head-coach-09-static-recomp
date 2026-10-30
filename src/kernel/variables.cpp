@@ -1,7 +1,7 @@
 // Imported kernel data variables (XboxHardwareInfo, KeTimeStampBundle, ...) and the
 // import-table slots that point at them.
 
-#include <windows.h>
+#include "common/host_time.h"
 
 #include <chrono>
 #include <cstdio>
@@ -84,7 +84,7 @@ namespace hc09
 
         void UpdateTimeStampBundle()
         {
-            const uint64_t ticks = GetTickCount64();
+            const uint64_t ticks = host::TickCountMs();
             Store<uint64_t>(g_timeStampBundle + 0x00, ticks * 10000);  // 100 ns units
             Store<uint64_t>(g_timeStampBundle + 0x08, SystemTime());
             Store<uint32_t>(g_timeStampBundle + 0x10, uint32_t(ticks));

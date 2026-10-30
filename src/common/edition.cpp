@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/strings.h"
 #include "kernel/guest.h"
 #include "kernel/heap.h"
 #include "kernel/vfs.h"
@@ -114,7 +115,7 @@ namespace hc09::edition
                 continue;  // the name itself
             for (size_t at = 0; at + renamedLength <= length; at++)
             {
-                if (_strnicmp(name + at, renamed, renamedLength) != 0)
+                if (CompareNoCase(name + at, renamed, renamedLength) != 0)
                     continue;
                 std::string saved(name);
                 for (size_t i = 0; i < originalLength; i++)  // in the case the name is written in
@@ -156,7 +157,7 @@ namespace
         for (const auto& [head, body] : kBodySwaps)
         {
             const size_t length = std::strlen(head);
-            if (_strnicmp(name, head, length) != 0 || _strnicmp(name + length, "body", 4) != 0)
+            if (CompareNoCase(name, head, length) != 0 || CompareNoCase(name + length, "body", 4) != 0)
                 continue;
             std::string swapped = std::string(body) + (name + length);
             if (std::isupper(static_cast<unsigned char>(name[0])))
@@ -175,11 +176,11 @@ namespace
         if (run(true) != 1 || *p++ != '_')
             return {};
         const bool thin = std::tolower(static_cast<unsigned char>(*p)) == 't';
-        if (!run(false) || *p++ != '_' || !run(false) || *p++ != '_' || run(true) != 3 || _strnicmp(p, "body", 4) != 0)
+        if (!run(false) || *p++ != '_' || !run(false) || *p++ != '_' || run(true) != 3 || CompareNoCase(p, "body", 4) != 0)
             return {};
         const bool upper = std::isupper(static_cast<unsigned char>(p[0]));
         std::string body = std::string("genericwarm") + (thin ? "base" : "muscular") + "body";
-        if (_strnicmp(p + 4, "warm", 4) == 0)
+        if (CompareNoCase(p + 4, "warm", 4) == 0)
             p += 4;  // <head>bodywarm_big and <head>body_big are both the generic body's one package
         body += p + 4;
         if (upper)  // in the case the name is written in
