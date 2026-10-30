@@ -3,6 +3,8 @@
 //
 //   hc09 [image.pe] [default.xex] [disc.iso] [userdata folder]
 //
+// In the Android app (HC09_ANDROID_APP) there is no main(): src/android/jni_main.cpp calls RunGame.
+//
 // Defaults are the developer layout (build/default.pe, build/extracted/default.xex,
 // iso/HC09.iso, build/userdata) relative to the current directory.
 
@@ -32,6 +34,8 @@
 namespace hc09
 {
     uint8_t* g_base = nullptr;
+
+    int RunGame(const char* imagePath, const char* xexPath, const char* isoPath, const char* userData);
 
     void ReportStubCall(const char* name, const char* library, const PPCContext& ctx, bool& reported)
     {
@@ -126,14 +130,15 @@ namespace
     }
 }
 
-int main(int argc, char** argv)
+// Boots the game on the calling thread; returns only if it fails to start or the title exits.
+// Paths left null use the developer layout (see the top of this file).
+int hc09::RunGame(const char* imagePath, const char* xexPath, const char* isoPathText, const char* userData)
 {
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
     std::fprintf(stderr, "[boot] %s recomp " HC09_VERSION " (posix)\n", hc09::edition::kName);
-    const char* imagePath = argc > 1 ? argv[1] : "build/default.pe";
-    const char* xexPath = argc > 2 ? argv[2] : "build/extracted/default.xex";
-    const std::filesystem::path isoPath = argc > 3 ? std::filesystem::path(argv[3]) : std::filesystem::path("iso/HC09.iso");
-    const char* userData = argc > 4 ? argv[4] : std::getenv("HC09_USERDATA") ? std::getenv("HC09_USERDATA") : hc09::edition::kUserData;
+    imagePath = imagePath ? imagePath : "build/default.pe";
+    xexPath = xexPath ? xexPath : "build/extracted/default.xex";
+    const std::filesystem::path isoPath = isoPathText ? isoPathText : "iso/HC09.iso";
+    userData = userData ? userData : std::getenv("HC09_USERDATA") ? std::getenv("HC09_USERDATA") : hc09::edition::kUserData;
     char message[512];
 
     if (!hc09::AllocateGuestMemory())
@@ -169,3 +174,12 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "[boot] entry point returned\n");
     return EXIT_SUCCESS;
 }
+
+#ifndef HC09_ANDROID_APP
+int main(int argc, char** argv)
+{
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    return hc09::RunGame(argc > 1 ? argv[1] : nullptr, argc > 2 ? argv[2] : nullptr, argc > 3 ? argv[3] : nullptr,
+        argc > 4 ? argv[4] : nullptr);
+}
+#endif

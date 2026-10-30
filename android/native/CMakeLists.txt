@@ -75,10 +75,27 @@ set(HC09_HOST_SOURCES
     src/kernel/xex.cpp)
 list(TRANSFORM HC09_HOST_SOURCES PREPEND ${HC09_ROOT}/)
 
-add_executable(hc09_headless ${HC09_HOST_SOURCES})
-target_include_directories(hc09_headless PRIVATE ${HC09_ROOT}/src ${HC09_ROOT}/thirdparty/XenonRecomp/thirdparty/xxHash)
-target_compile_definitions(hc09_headless PRIVATE HC09_VERSION="${PROJECT_VERSION}" HC09_NO_FFMPEG)
-target_compile_options(hc09_headless PRIVATE ${HC09_ARM_FLAGS})
-# --export-dynamic names recompiled functions (sub_<address>) in stack dumps; 16 KB pages for newer phones.
-target_link_options(hc09_headless PRIVATE -Wl,--export-dynamic -Wl,-z,max-page-size=16384)
-target_link_libraries(hc09_headless PRIVATE HC09RecompLib android log)
+option(HC09_ANDROID_APP "Build libhc09.so for the Android app (android/app) instead of hc09_headless" OFF)
+
+if(HC09_ANDROID_APP)
+    # The app's library: the same host layer, entered through JNI (src/android/jni_main.cpp), with
+    # Vulkan presentation (src/gpu/vulkan_context.cpp).
+    add_library(hc09 SHARED ${HC09_HOST_SOURCES}
+        ${HC09_ROOT}/src/android/jni_main.cpp
+        ${HC09_ROOT}/src/gpu/vulkan_context.cpp)
+    set(HC09_TARGET hc09)
+    target_compile_definitions(hc09 PRIVATE HC09_ANDROID_APP)
+    target_link_libraries(hc09 PRIVATE vulkan)
+else()
+    add_executable(hc09_headless ${HC09_HOST_SOURCES})
+    set(HC09_TARGET hc09_headless)
+    # --export-dynamic names recompiled functions (sub_<address>) in stack dumps.
+    target_link_options(hc09_headless PRIVATE -Wl,--export-dynamic)
+endif()
+
+target_include_directories(${HC09_TARGET} PRIVATE ${HC09_ROOT}/src ${HC09_ROOT}/thirdparty/XenonRecomp/thirdparty/xxHash)
+target_compile_definitions(${HC09_TARGET} PRIVATE HC09_VERSION="${PROJECT_VERSION}" HC09_NO_FFMPEG)
+target_compile_options(${HC09_TARGET} PRIVATE ${HC09_ARM_FLAGS})
+# 16 KB pages for newer phones.
+target_link_options(${HC09_TARGET} PRIVATE -Wl,-z,max-page-size=16384)
+target_link_libraries(${HC09_TARGET} PRIVATE HC09RecompLib android log)

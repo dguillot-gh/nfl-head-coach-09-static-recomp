@@ -1,0 +1,2 @@
+rootProject.name = 'hc09-android'
+include ':app'
