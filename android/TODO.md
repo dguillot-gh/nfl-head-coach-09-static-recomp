@@ -54,8 +54,8 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
       Back/Start, both analog sticks with stick clicks. Multi-touch, slide between buttons, haptics.
 - [ ] Pad editor: drag to move, bigger/smaller, rename, hide, opacity, reset (saved per game).
 - [ ] Hide the pad automatically when a controller or keyboard is used.
-- [ ] HC09 is menu-heavy (play calling, career screens): consider **direct touch** for menus later
-      (tap a menu item), the way Policenauts got tap-to-point.
+- [ ] HC09 is menu-heavy (play calling, career screens): **direct touch** for menus (tap a menu item),
+      the way Policenauts got tap-to-point. Wanted (2026-10-30): an add-on after the pad.
 - [ ] Pad menu (≡): Save state, Load state, settings, Quit.
 
 ## Audio

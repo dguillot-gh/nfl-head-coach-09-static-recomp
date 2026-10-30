@@ -26,6 +26,7 @@
 #include "android/app_glue.h"
 #include "gpu/draw.h"
 #include "gpu/vulkan_context.h"
+#include "kernel/host_input.h"
 
 namespace hc09
 {
@@ -219,6 +220,27 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_setAssetMana
         return;
     g_assetsObject = env->NewGlobalRef(assets);
     g_assets = AAssetManager_fromJava(env, g_assetsObject);
+}
+
+// Player 1's controller: the on-screen pad merged with any real gamepad (GameActivity does the merging).
+extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_setPad(JNIEnv*, jclass, jint buttons, jint leftTrigger,
+    jint rightTrigger, jint leftX, jint leftY, jint rightX, jint rightY)
+{
+    XINPUT_GAMEPAD pad{};
+    pad.wButtons = WORD(buttons);
+    pad.bLeftTrigger = BYTE(leftTrigger);
+    pad.bRightTrigger = BYTE(rightTrigger);
+    pad.sThumbLX = SHORT(leftX);
+    pad.sThumbLY = SHORT(leftY);
+    pad.sThumbRX = SHORT(rightX);
+    pad.sThumbRY = SHORT(rightY);
+    hc09::host::SetHostPad(true, pad);
+}
+
+// Frames the game has presented so far (the menu's frame-rate counter).
+extern "C" JNIEXPORT jint JNICALL Java_com_hc09_recomp_NativeBridge_frameNumber(JNIEnv*, jclass)
+{
+    return g_gameStarted ? hc09::gpu::FrameNumber() : 0;
 }
 
 namespace hc09::android
