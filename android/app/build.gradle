@@ -2,6 +2,14 @@ plugins {
     id 'com.android.application'
 }
 
+// hc09.ffmpegSource in local.properties: the FFmpeg 8.0 source tree the XMA decoder is built from
+// (see android/native/CMakeLists.txt).
+def localProperties = new Properties()
+if (rootProject.file('local.properties').exists()) {
+    rootProject.file('local.properties').withInputStream { localProperties.load(it) }
+}
+def ffmpegSource = localProperties.getProperty('hc09.ffmpegSource', '')
+
 android {
     namespace = 'com.hc09.recomp'
     compileSdk 35
@@ -16,7 +24,7 @@ android {
         versionName '0.1.0'
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_static', '-DHC09_ANDROID_APP=ON'
+                arguments '-DANDROID_STL=c++_static', '-DHC09_ANDROID_APP=ON', "-DHC09_FFMPEG_SOURCE=${ffmpegSource}"
                 targets 'hc09'
                 abiFilters 'arm64-v8a'
             }

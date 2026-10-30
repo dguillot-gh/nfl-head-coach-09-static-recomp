@@ -38,4 +38,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## Fetched separately (not included in this repository)
 
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — MIT; modified by `patches/xenonrecomp.patch`.
-- [FFmpeg](https://ffmpeg.org) — LGPL 2.1+ shared build, dynamically linked.
+- [FFmpeg](https://ffmpeg.org) — LGPL 2.1+ shared build, dynamically linked. The Android app compiles
+  FFmpeg 8.0's libavutil and XMA2 decoder from unmodified source into `libhc09.so`
+  (`android/native/CMakeLists.txt`); this repository holds everything needed to rebuild and relink it.
