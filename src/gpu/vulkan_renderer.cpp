@@ -124,6 +124,7 @@ namespace hc09::gpu
         std::chrono::steady_clock::duration g_phaseTime[kPhaseCount]{};
         std::chrono::steady_clock::time_point g_phaseStart;
         int g_phase = -1;
+        uint64_t g_statIndices = 0, g_statVertexBytes = 0, g_statHashedBytes = 0;  // since the last report
 
         // Ends the running phase (if any) and starts `next` (-1: none).
         void Phase(int next)
@@ -708,6 +709,34 @@ namespace hc09::gpu
                 VkDescriptorBufferInfo* streams);
             // Releases resolve targets neither resolved to nor sampled for a while, and stale textures.
             void EvictIdleResources(uint32_t frontBuffer);
+
+            // Guest data converted for the GPU (vertex streams, index buffers) that has stayed the same over
+            // frames is kept in host-visible slabs instead of being converted again each frame (in a game,
+            // ~9 MB of vertices and ~500k indices a frame). The source is hashed once a frame; when it changes
+            // the kept copy is dropped (never rewritten: the GPU may still be reading it). Slabs are only
+            // appended to, and freed once nothing in them is kept.
+            struct Slab
+            {
+                VulkanContext::Chunk chunk;
+                VkDeviceSize used = 0, live = 0;
+            };
+            struct StableData
+            {
+                uint64_t hash = 0;
+                uint32_t sourceBytes = 0;
+                int checkedFrame = -1, lastUsed = -1;
+                uint32_t sameFrames = 0;  // checks in a row that found the same contents
+                Slab* slab = nullptr;     // the kept copy (null: none)
+                VkDeviceSize offset = 0, size = 0;
+                uint32_t count = 0, maxIndex = 0;  // index buffers: converted indices and the largest
+            };
+            static constexpr uint32_t kStableAfterFrames = 2;
+            StableData& CheckStable(uint64_t key, const uint8_t* source, uint32_t bytes);
+            uint8_t* KeepStable(StableData& data, VkDeviceSize size);
+            void ReleaseStable(StableData& data);
+            std::vector<std::unique_ptr<Slab>> slabs_;
+            std::unordered_map<uint64_t, StableData> stableData_;
+            StableData* stableIndices_ = nullptr;  // set by PrepareIndices when the draw's indices are kept
 
             VulkanContext context_;
             uint64_t windowGeneration_ = 0;
@@ -1579,6 +1608,7 @@ namespace hc09::gpu
             bool& rectangles)
         {
             rectangles = false;
+            stableIndices_ = nullptr;
             bool convert = false;
             switch (draw.primitive)
             {
@@ -1606,9 +1636,26 @@ namespace hc09::gpu
             if (!indexed)
                 return true;
 
+            // An index buffer in memory that has not changed for a few frames is converted once and kept
+            // (with its largest index, which the vertex uploads need).
+            StableData* stable = nullptr;
+            if (draw.source == IndexSource::Dma && !rectangles)
+            {
+                const uint32_t sourceBytes = draw.index32 ? draw.indexCount * 4 : ((draw.indexCount + 1) & ~1u) * 2;
+                const uint64_t key[4] = { 2, draw.indexAddress,  // (2: indices)
+                    (uint64_t(draw.indexCount) << 8) | (uint64_t(draw.index32) << 4) | uint64_t(draw.indexEndian), uint64_t(draw.primitive) };
+                stable = &CheckStable(XXH3_64bits(key, sizeof(key)), GuestToHost(draw.indexAddress), sourceBytes);
+                if (stable->slab)
+                {
+                    stableIndices_ = stable;
+                    return true;
+                }
+            }
+
             // Source indices (as 32-bit; 16-bit restart values widen to 0xFFFFFFFF).
             std::vector<uint32_t>& source = sourceIndices_;
             source.resize(draw.indexCount);
+            g_statIndices += draw.indexCount;
             for (uint32_t i = 0; i < draw.indexCount; i++)
             {
                 uint32_t value = i;
@@ -1657,6 +1704,19 @@ namespace hc09::gpu
             default:
                 indices.swap(source);  // (both buffers are kept for the next draws)
                 break;
+            }
+            if (stable && stable->sameFrames >= kStableAfterFrames && !indices.empty())
+            {
+                if (uint8_t* kept = KeepStable(*stable, indices.size() * 4))
+                {
+                    std::memcpy(kept, indices.data(), indices.size() * 4);
+                    stable->count = uint32_t(indices.size());
+                    stable->maxIndex = 0;
+                    for (uint32_t index : indices)
+                        if (index != 0xFFFFFFFF)
+                            stable->maxIndex = std::max(stable->maxIndex, index);
+                    stableIndices_ = stable;
+                }
             }
             return true;
         }
@@ -1941,7 +2001,12 @@ namespace hc09::gpu
             for (auto& stream : streams)
                 stream = { dummyBuffer_, 0, VK_WHOLE_SIZE };
             uint32_t maxVertexIndex = draw.indexCount ? draw.indexCount - 1 : 0;
-            if (indexed)
+            StableData* const keptIndices = stableIndices_;
+            if (indexed && keptIndices)
+            {
+                maxVertexIndex = keptIndices->maxIndex;
+            }
+            else if (indexed)
             {
                 maxVertexIndex = 0;
                 for (uint32_t index : indices)
@@ -1987,21 +2052,37 @@ namespace hc09::gpu
                 }
                 else
                 {
-                    upload = context_.Allocate(uint64_t(dwords) * 4, limits.minStorageBufferOffsetAlignment);
-                    if (!upload.cpu)
-                        continue;
-                    auto* dest = reinterpret_cast<uint32_t*>(upload.cpu);
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(GuestToHost(address));
-                    const uint32_t swap = d1 & 3;
-                    if (swap == 2)
+                    const uint64_t stableKey[3] = { 1, uploadKey, dwords };  // (1: vertex data)
+                    StableData& stable = CheckStable(XXH3_64bits(stableKey, sizeof(stableKey)), reinterpret_cast<const uint8_t*>(src),
+                        dwords * 4);
+                    if (stable.slab)
                     {
-                        for (uint32_t i = 0; i < dwords; i++)
-                            dest[i] = __builtin_bswap32(src[i]);
+                        upload = { stable.slab->chunk.buffer, stable.offset, stable.slab->chunk.cpu + stable.offset };
                     }
                     else
                     {
-                        for (uint32_t i = 0; i < dwords; i++)
-                            dest[i] = GpuSwap(src[i], swap);
+                        // Unchanged for a few frames: converted once more, into memory it is kept in.
+                        uint8_t* kept = stable.sameFrames >= kStableAfterFrames ? KeepStable(stable, uint64_t(dwords) * 4) : nullptr;
+                        if (kept)
+                            upload = { stable.slab->chunk.buffer, stable.offset, kept };
+                        else
+                            upload = context_.Allocate(uint64_t(dwords) * 4, limits.minStorageBufferOffsetAlignment);
+                        if (!upload.cpu)
+                            continue;
+                        auto* dest = reinterpret_cast<uint32_t*>(upload.cpu);
+                        const uint32_t swap = d1 & 3;
+                        if (swap == 2)
+                        {
+                            for (uint32_t i = 0; i < dwords; i++)
+                                dest[i] = __builtin_bswap32(src[i]);
+                        }
+                        else
+                        {
+                            for (uint32_t i = 0; i < dwords; i++)
+                                dest[i] = GpuSwap(src[i], swap);
+                        }
+                        g_statVertexBytes += uint64_t(dwords) * 4;
                     }
                     vertexUploads_[uploadKey] = { upload, dwords };
                 }
@@ -2192,7 +2273,13 @@ namespace hc09::gpu
 
             Phase(kPhaseRecord);
             VulkanContext::Allocation indexUpload{};
-            if (indexed)
+            uint32_t indexCount = uint32_t(indices.size());
+            if (indexed && keptIndices)
+            {
+                indexUpload = { keptIndices->slab->chunk.buffer, keptIndices->offset, nullptr };
+                indexCount = keptIndices->count;
+            }
+            else if (indexed)
             {
                 indexUpload = context_.Allocate(indices.size() * 4, 4);
                 if (!indexUpload.cpu)
@@ -2243,7 +2330,7 @@ namespace hc09::gpu
             {
                 vkCmdBindIndexBuffer(list, indexUpload.buffer, indexUpload.offset, VK_INDEX_TYPE_UINT32);
                 // VGT_INDX_OFFSET is applied in the vertex shader (vertexIndexOffset).
-                vkCmdDrawIndexed(list, uint32_t(indices.size()), 1, 0, 0, 0);
+                vkCmdDrawIndexed(list, indexCount, 1, 0, 0, 0);
             }
             else
             {
@@ -2545,6 +2632,18 @@ namespace hc09::gpu
             textures_->Evict(g_frame);
             if (g_frame % 300 != 0)
                 return;
+            for (auto it = stableData_.begin(); it != stableData_.end();)
+            {
+                if (g_frame - it->second.lastUsed > 600)
+                {
+                    ReleaseStable(it->second);
+                    it = stableData_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
             for (auto it = resolveTargets_.begin(); it != resolveTargets_.end();)
             {
                 const int lastUse = std::max(it->second.lastResolved, textures_->ResolvedLastUse(it->first));
@@ -2564,6 +2663,67 @@ namespace hc09::gpu
                     ++it;
                 }
             }
+        }
+
+        Renderer::StableData& Renderer::CheckStable(uint64_t key, const uint8_t* source, uint32_t bytes)
+        {
+            StableData& data = stableData_[key];
+            data.lastUsed = g_frame;
+            if (data.checkedFrame == g_frame && data.sourceBytes == bytes)
+                return data;
+            const uint64_t hash = XXH3_64bits(source, bytes);
+            g_statHashedBytes += bytes;
+            if (data.checkedFrame >= 0 && data.sourceBytes == bytes && hash == data.hash)
+            {
+                data.sameFrames++;
+            }
+            else
+            {
+                ReleaseStable(data);
+                data.hash = hash;
+                data.sourceBytes = bytes;
+                data.sameFrames = 0;
+            }
+            data.checkedFrame = g_frame;
+            return data;
+        }
+
+        uint8_t* Renderer::KeepStable(StableData& data, VkDeviceSize size)
+        {
+            ReleaseStable(data);
+            constexpr VkDeviceSize kAlign = 256, kSlabSize = 8ull << 20;
+            Slab* slab = slabs_.empty() ? nullptr : slabs_.back().get();
+            VkDeviceSize offset = slab ? (slab->used + kAlign - 1) / kAlign * kAlign : 0;
+            if (!slab || offset + size > slab->chunk.size)
+            {
+                auto made = std::make_unique<Slab>();
+                if (!context_.CreateChunk(std::max(size, kSlabSize), made->chunk))
+                    return nullptr;
+                slab = made.get();
+                slabs_.push_back(std::move(made));
+                offset = 0;
+            }
+            slab->used = offset + size;
+            slab->live += size;
+            data.slab = slab;
+            data.offset = offset;
+            data.size = size;
+            return slab->chunk.cpu + offset;
+        }
+
+        void Renderer::ReleaseStable(StableData& data)
+        {
+            Slab* slab = data.slab;
+            data.slab = nullptr;
+            if (!slab)
+                return;
+            slab->live -= data.size;
+            if (slab->live != 0)
+                return;
+            // Nothing kept in it any more: freed once the frames that may read it are done.
+            VulkanContext* context = &context_;
+            context_.DestroyLater([context, chunk = slab->chunk]() mutable { context->DestroyChunk(chunk); });
+            slabs_.erase(std::find_if(slabs_.begin(), slabs_.end(), [slab](const auto& s) { return s.get() == slab; }));
         }
 
         void Renderer::Swap(uint32_t frontBuffer)
@@ -2620,6 +2780,13 @@ namespace hc09::gpu
                     std::fprintf(stderr, " = %.1f | inside: acquire %.2f submit %.2f (%.1f/frame) present %.2f fence %.2f | gpu %.1f | %.1f new chunks/frame\n",
                         cpu, waits.acquire * 1000 / frames, waits.submit * 1000 / frames, waits.submits / frames, waits.present * 1000 / frames,
                         waits.fence * 1000 / frames, waits.gpuFrames ? waits.gpu * 1000 / waits.gpuFrames : 0.0, waits.chunks / frames);
+                    const VulkanTextureCache::Work work = textures_->TakeWork();
+                    std::fprintf(stderr, "[gpu] per frame: textures %.0f looked up, %.2f MB hashed, %.1f uploaded (%.2f MB) | "
+                        "%.0fk indices converted | %.2f MB vertices copied | %.2f MB checked, %zu slabs kept\n", work.lookups / frames,
+                        work.hashedBytes / frames / 1048576.0, work.uploads / frames, work.uploadBytes / frames / 1048576.0,
+                        g_statIndices / frames / 1000.0, g_statVertexBytes / frames / 1048576.0, g_statHashedBytes / frames / 1048576.0,
+                        slabs_.size());
+                    g_statIndices = g_statVertexBytes = g_statHashedBytes = 0;
                     last = now;
                     lastFrame = g_frame;
                 }

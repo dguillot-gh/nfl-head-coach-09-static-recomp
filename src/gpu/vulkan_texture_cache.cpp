@@ -634,24 +634,30 @@ namespace hc09::gpu
         // Hashing large textures on every draw dominates frame time, so a texture's contents
         // are checked once per frame (guest writes to it mid-frame are picked up next frame).
         auto fullHash = [&] {
+            work_.hashedBytes += sourceBytes + mipBytes;
             uint64_t value = XXH3_64bits(source, sourceBytes);
             if (mipBytes)
                 value ^= XXH3_64bits(mipSource, mipBytes) * 0x9E3779B97F4A7C15ull;
             return value;
         };
         const int frame = FrameNumber();
-        const bool check = entry.hashedFrame != frame;
+        work_.lookups++;
+        // A texture that has never changed since its upload (most of them: 16 MB of hashing a frame in a
+        // game) is checked every 4th frame, spread over textures by address; one that has changed before
+        // (text glyph cache, video) every frame. A first change shows up to 3 frames late.
+        const bool due = entry.rewritten || entry.contentHash == ~0ull || ((uint32_t(frame) + (fetch.baseAddress() >> 12)) & 3) == 0;
+        const bool check = entry.hashedFrame != frame && due;
         entry.hashedFrame = frame;
         uint64_t hash = entry.contentHash;
         if (check)
         {
-            // Large textures: a sampled hash (64 chunks spread over the base level) every frame,
-            // which catches whole-image updates such as video, and a full hash every 60 frames.
+            // Large textures: a sampled hash (64 chunks spread over the base level) at each check,
+            // which catches whole-image updates such as video, and a full hash every 15th check (~60 frames).
             // One that has changed since its first upload is hashed in full every frame: the
             // samples miss small updates such as the text glyph cache (a 256x512 texture the game
             // adds each new character to), whose new text would otherwise show other glyphs.
             constexpr uint64_t kFullHashLimit = 256 * 1024, kChunk = 256, kChunks = 64;
-            if (sourceBytes + mipBytes <= kFullHashLimit || frame % 60 == int(entry.contentHash % 60) || entry.contentHash == ~0ull ||
+            if (sourceBytes + mipBytes <= kFullHashLimit || (frame / 4) % 15 == int(entry.contentHash % 15) || entry.contentHash == ~0ull ||
                 entry.rewritten)
             {
                 hash = fullHash();
@@ -790,6 +796,7 @@ namespace hc09::gpu
                     const VulkanContext::Allocation upload = context_.Allocate(bytes, 16);
                     if (!upload.cpu)
                         continue;
+                    work_.uploadBytes += bytes;
                     if (info.decode)
                         DecodeTexels(format, info, dest, rowBytes, levelWidth, levelHeight, upload.cpu);
                     else
@@ -818,6 +825,7 @@ namespace hc09::gpu
                     regions.data());
             Barrier(commands, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, levels, layers);
             entry.uploaded = true;
+            work_.uploads++;
         }
         out.format = entry.format;
         out.view = GetView(entry.views, entry.image, entry.format, out.type, EncodeMapping(fetch.swizzle(), info.decode ? identity : info.remap),

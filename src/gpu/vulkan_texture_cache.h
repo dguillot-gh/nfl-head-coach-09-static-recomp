@@ -69,6 +69,18 @@ namespace hc09::gpu
             uint64_t staleResolves = 0;
             uint64_t evictedTextures = 0;
         };
+        // HC09_GPU_STATS: work done by Get since the last call (lookups past the per-frame memo, bytes
+        // hashed to detect changes, uploads and their bytes).
+        struct Work
+        {
+            uint64_t lookups = 0, hashedBytes = 0, uploads = 0, uploadBytes = 0;
+        };
+        Work TakeWork()
+        {
+            const Work work = work_;
+            work_ = {};
+            return work;
+        }
         Stats GetStats() const { return { entries_.size(), resolved_.size(), mismatchedResolveHits_, staleResolves_, evictedTextures_ }; }
 
     private:
@@ -121,6 +133,7 @@ namespace hc09::gpu
         std::unordered_map<uint64_t, Recent> recent_;
         int recentFrame_ = -1;
         uint64_t recentGeneration_ = 0;  // counts the clears of recent_
+        Work work_;
 
         VulkanContext& context_;
         std::unordered_map<uint64_t, Entry> entries_;

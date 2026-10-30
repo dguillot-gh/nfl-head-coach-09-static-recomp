@@ -88,6 +88,18 @@ namespace hc09::gpu
         // Runs `release` once the GPU has finished the frame being recorded (destroys resources it uses).
         void DestroyLater(std::function<void()> release);
 
+        // A mapped host-visible buffer (uniform, storage, index, transfer source) of its own, kept until
+        // DestroyChunk: the per-frame memory is made of these, and the renderer keeps longer-lived data in them.
+        struct Chunk
+        {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            uint8_t* cpu = nullptr;
+            VkDeviceSize size = 0;
+        };
+        bool CreateChunk(VkDeviceSize size, Chunk& chunk);
+        void DestroyChunk(Chunk& chunk);
+
         // Device-local image with its own memory; false on failure (logged).
         bool CreateImage(const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory);
         uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags) const;
@@ -125,13 +137,6 @@ namespace hc09::gpu
         std::vector<VkFramebuffer> framebuffers_;
         bool swapchainStale_ = false;
 
-        struct Chunk
-        {
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            uint8_t* cpu = nullptr;
-            VkDeviceSize size = 0;
-        };
         struct Frame
         {
             std::vector<Chunk> chunks;  // [0] is kept; the others are released when the frame is reused
@@ -145,8 +150,6 @@ namespace hc09::gpu
             VkCommandBuffer uploads = VK_NULL_HANDLE;  // null until something is uploaded
         };
         Frame frames_[kFramesInFlight];
-        bool CreateChunk(VkDeviceSize size, Chunk& chunk);
-        void DestroyChunk(Chunk& chunk);
         VkDescriptorPool CreatePool();
 
         VkCommandPool commandPool_ = VK_NULL_HANDLE;

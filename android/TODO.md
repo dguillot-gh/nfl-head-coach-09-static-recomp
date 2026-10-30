@@ -82,8 +82,13 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
 - [x] Shaders missing from the APK are saved on the phone (`files/missing-shaders`, pull with
       `adb exec-out run-as com.hc09.recomp cat files/missing-shaders/<f>`), converted with XenosToHlsl +
       shaders_to_spirv.py: 152 shaders now; the Pixel draws a whole game with 0 skipped draws.
-- [ ] In a game the Pixel runs 13-20 fps (~33-36 ms renderer CPU, GPU ~20-23 ms): textures 9-10 ms (hashing
-      / CPU untiling), setup 7-8 (index conversion), vertices 6-7 (byte-swapped copies). GPU paths next.
+- [x] In a game the renderer redid the same work each frame (16 MB of texture hashing, ~550k indices and
+      ~8.4 MB of vertices converted). Textures that never changed are checked every 4th frame; vertex and
+      index data unchanged for 2 frames is converted once into kept slabs (hashed each frame to stay valid).
+      Pixel: the same fps with ~2.5x the draws (20.5 fps at 1,414 draws/frame, was 19 at 596).
+- [ ] Pixel in a game: ~33 ms renderer CPU (vertices ~8, mostly hashing 11.6 MB/frame to validate the kept
+      copies; constants, descriptors, record, setup ~3.5-4 each), GPU ~22 ms. Next: skip re-hashing
+      long-stable buffers (write-watch on guest pages would make this exact), fewer descriptor writes.
 - [ ] V30 refuses pipelines: Adreno's log says "Bind group info mismatches the shader source for symbol
       texture2_2d" (also texture6, FloatConstants, ...). Bindings are now visible only to the stages that
       declare them (fixed C0DEA8AD11DC6C29 and 51ADA21A38FAF13D on Coach Now), but ~15 pairs still fail in a
