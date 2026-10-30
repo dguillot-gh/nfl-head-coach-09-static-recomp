@@ -74,6 +74,15 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
 - [ ] V30 driver refuses ps C0DEA8AD11DC6C29 (VK_INCOMPLETE; ~79 draws/frame skipped on Coach Now), down
       from 11 refused pairs before the forward-only translation. The V30's Coach Now looks tinted blue next
       to the Pixel's: likely those missing draws (a lighting pass?) or a colour/format issue on Adreno.
+- [x] Coach Now frame time (2026-10-30): the command-processor thread (the whole renderer) sat on a little
+      core while the title's spinning job threads held the big ones, ~35-40 us per draw. It now keeps to the
+      faster clusters (`HC09_CP_FAST_CORES=0` turns that off): Pixel 8 14 -> 19 fps, V30 12 -> 19 fps.
+      `HC09_GPU_STATS` prints ms/frame per Draw phase, acquire/submit/present/fence waits and GPU time.
+- [ ] Coach Now is still CPU-bound on the renderer thread (~30 ms/frame Pixel, ~40 ms V30, for ~1,550 draws):
+      next are the per-draw costs (textures, record, setup, constants), and the title's job threads 0x150-0x15C
+      spinning on NtYieldExecution / zero KeDelayExecutionThread (~95% of a big core each).
+- [ ] V30: pipelines fail to build at random (VK_INCOMPLETE, 2-10 pairs per run, different each run), so
+      Coach Now skips 0-630 draws depending on the run. Retry failed pairs later instead of never.
 - [ ] Per-device profiles (V30 vs Pixel 8) and an FPS counter option.
 - [ ] Logs and crash reports to `Android/data/<pkg>/files/logs` (stack traces via unwind).
 - [ ] Keep HC09's debug switches usable on Android (`HC09_PRESS` scripted input, fence/stack tracing)

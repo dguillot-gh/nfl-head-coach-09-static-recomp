@@ -19,6 +19,12 @@
 #include <mutex>
 #include <thread>
 
+#if defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#include <climits>
+#endif
+
 #include "debug/stack_dump.h"
 #include "gpu/draw.h"
 #include "gpu/shaders.h"
@@ -280,7 +286,12 @@ namespace hc09::gpu
         }
 
         // Packet statistics, printed every 2 seconds when HC09_GPU_STATS is set.
-        const bool g_statsEnabled = std::getenv("HC09_GPU_STATS") != nullptr;
+        // (Read on first use: the Android app applies env.txt after the library is loaded.)
+        bool StatsEnabled()
+        {
+            static const bool enabled = std::getenv("HC09_GPU_STATS") != nullptr;
+            return enabled;
+        }
         uint32_t g_opcodeCounts[128];
         uint32_t g_type0Writes = 0;
         uint64_t g_dwordsConsumed = 0;
@@ -295,7 +306,7 @@ namespace hc09::gpu
 
         void ReportStats()
         {
-            if (!g_statsEnabled)
+            if (!StatsEnabled())
                 return;
             const auto now = std::chrono::steady_clock::now();
             const double seconds = std::chrono::duration<double>(now - g_statsStart).count();
@@ -716,9 +727,51 @@ namespace hc09::gpu
             }
         }
 
+#if defined(__ANDROID__)
+        // Phones mix fast and slow cores, and the scheduler left this thread (the whole renderer) on a
+        // slow one while the title's spinning threads held the fast ones: 33-40 us per draw on Coach
+        // Now. It keeps to the cores of the faster clusters (all but the slowest).
+        // HC09_CP_FAST_CORES=0 leaves it to the scheduler.
+        void KeepToFastCores()
+        {
+            if (const char* value = std::getenv("HC09_CP_FAST_CORES"); value && std::atoi(value) == 0)
+                return;
+            const long cores = std::min(sysconf(_SC_NPROCESSORS_CONF), long(CPU_SETSIZE));
+            std::vector<long> maxFrequency(size_t(std::max(cores, 0L)), 0);
+            long slowest = LONG_MAX, fastest = 0;
+            for (long cpu = 0; cpu < cores; cpu++)
+            {
+                char path[96];
+                std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", cpu);
+                if (FILE* file = std::fopen(path, "r"))
+                {
+                    if (std::fscanf(file, "%ld", &maxFrequency[cpu]) != 1)
+                        maxFrequency[cpu] = 0;
+                    std::fclose(file);
+                }
+                if (maxFrequency[cpu] <= 0)
+                    return;  // unknown: leave it to the scheduler
+                slowest = std::min(slowest, maxFrequency[cpu]);
+                fastest = std::max(fastest, maxFrequency[cpu]);
+            }
+            if (cores <= 0 || slowest == fastest)
+                return;
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            for (long cpu = 0; cpu < cores; cpu++)
+                if (maxFrequency[cpu] > slowest)
+                    CPU_SET(int(cpu), &set);
+            const bool kept = sched_setaffinity(0, sizeof(set), &set) == 0;
+            std::fprintf(stderr, "[gpu] command processor on %d fast cores%s\n", CPU_COUNT(&set), kept ? "" : " (sched_setaffinity failed)");
+        }
+#endif
+
         void CommandProcessorThread()
         {
             debug::RegisterThread(0xC0);  // shows up as 0xC0 in HC09_THREAD_STATS
+#if defined(__ANDROID__)
+            KeepToFastCores();
+#endif
             uint32_t idleSpins = 0;
             for (;;)
             {

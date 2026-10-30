@@ -66,6 +66,15 @@ namespace hc09::gpu
         // Frames begun so far (transient allocations of earlier frames are gone).
         uint64_t frameCount() const { return frameCount_; }
 
+        // HC09_GPU_STATS: seconds the recording thread spent in the calls that can wait on the GPU or
+        // the window, the GPU's own time per frame (timestamps), and memory chunks made, since the last call.
+        struct Stats
+        {
+            double acquire = 0, submit = 0, present = 0, fence = 0, gpu = 0;
+            uint32_t gpuFrames = 0, submits = 0, chunks = 0;
+        };
+        Stats TakeStats();
+
         // Host-visible memory for this frame (uniforms, vertex data, indices, texture uploads).
         struct Allocation
         {
@@ -146,5 +155,9 @@ namespace hc09::gpu
         VkSemaphore renderDone_[kFramesInFlight]{};
         uint32_t frame_ = 0;
         uint64_t frameCount_ = 0;
+        Stats stats_;
+        // Two timestamps per frame in flight (start, end); null when the queue has none.
+        VkQueryPool timestamps_ = VK_NULL_HANDLE;
+        bool timestampsWritten_[kFramesInFlight]{};
     };
 }

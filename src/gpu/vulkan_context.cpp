@@ -4,6 +4,7 @@
 #include <vulkan/vulkan_android.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -22,6 +23,11 @@ namespace hc09::gpu
         }
 
         constexpr VkDeviceSize kChunkSize = 16ull << 20;
+
+        double SecondsSince(std::chrono::steady_clock::time_point start)
+        {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
     }
 
     VulkanContext::~VulkanContext()
@@ -179,6 +185,14 @@ namespace hc09::gpu
         poolInfo.queueFamilyIndex = queueFamily_;
         if (!Check(vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_), "vkCreateCommandPool"))
             return false;
+        if (familyProperties[queueFamily_].timestampValidBits > 0 && properties_.limits.timestampPeriod > 0)
+        {
+            VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryInfo.queryCount = kFramesInFlight * 2;
+            if (vkCreateQueryPool(device_, &queryInfo, nullptr, &timestamps_) != VK_SUCCESS)
+                timestamps_ = VK_NULL_HANDLE;
+        }
         for (uint32_t i = 0; i < kFramesInFlight; i++)
         {
             VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -299,6 +313,7 @@ namespace hc09::gpu
             Chunk chunk;
             if (!CreateChunk(std::max(size, kChunkSize), chunk))
                 return {};
+            stats_.chunks++;
             frame.chunks.push_back(chunk);
             offset = 0;
         }
@@ -404,7 +419,11 @@ namespace hc09::gpu
         VkSubmitInfo submit = waits;
         submit.commandBufferCount = count;
         submit.pCommandBuffers = buffers;
-        return Check(vkQueueSubmit(queue_, 1, &submit, fence), "vkQueueSubmit");
+        const auto start = std::chrono::steady_clock::now();
+        const bool submitted = Check(vkQueueSubmit(queue_, 1, &submit, fence), "vkQueueSubmit");
+        stats_.submit += SecondsSince(start);
+        stats_.submits++;
+        return submitted;
     }
 
     void VulkanContext::Submit()
@@ -413,9 +432,28 @@ namespace hc09::gpu
         frames_[frame_].commands = BeginCommands();
     }
 
+    VulkanContext::Stats VulkanContext::TakeStats()
+    {
+        const Stats stats = stats_;
+        stats_ = {};
+        return stats;
+    }
+
     void VulkanContext::BeginFrame()
     {
+        const auto start = std::chrono::steady_clock::now();
         vkWaitForFences(device_, 1, &frameDone_[frame_], VK_TRUE, UINT64_MAX);
+        stats_.fence += SecondsSince(start);
+        if (timestamps_ && timestampsWritten_[frame_])
+        {
+            uint64_t ticks[2];
+            if (vkGetQueryPoolResults(device_, timestamps_, frame_ * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+                    VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ticks[1] > ticks[0])
+            {
+                stats_.gpu += double(ticks[1] - ticks[0]) * properties_.limits.timestampPeriod * 1e-9;
+                stats_.gpuFrames++;
+            }
+        }
         Frame& frame = frames_[frame_];
         for (auto& release : frame.releases)
             release();
@@ -430,6 +468,12 @@ namespace hc09::gpu
         frame.nextBuffer = 0;
         frame.uploads = VK_NULL_HANDLE;
         frame.commands = BeginCommands();
+        if (timestamps_)
+        {
+            vkCmdResetQueryPool(frame.commands, timestamps_, frame_ * 2, 2);
+            vkCmdWriteTimestamp(frame.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, frame_ * 2);
+            timestampsWritten_[frame_] = false;
+        }
         frameCount_++;
     }
 
@@ -611,6 +655,9 @@ namespace hc09::gpu
             if (presentPass_)
                 vkDestroyRenderPass(device_, presentPass_, nullptr);
             presentPass_ = VK_NULL_HANDLE;
+            if (timestamps_)
+                vkDestroyQueryPool(device_, timestamps_, nullptr);
+            timestamps_ = VK_NULL_HANDLE;
             vkDestroyPipelineCache(device_, pipelineCache_, nullptr);
             vkDestroyCommandPool(device_, commandPool_, nullptr);
             vkDestroyDevice(device_, nullptr);
@@ -644,7 +691,9 @@ namespace hc09::gpu
         {
             // At most a second: a window that stops handing out images (going away, say) skips this
             // frame's picture rather than hanging the game.
+            const auto start = std::chrono::steady_clock::now();
             const VkResult result = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, imageReady_[frame], VK_NULL_HANDLE, &index);
+            stats_.acquire += SecondsSince(start);
             if (result == VK_ERROR_OUT_OF_DATE_KHR)
                 swapchainStale_ = true;
             else if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
@@ -682,6 +731,11 @@ namespace hc09::gpu
             submit.signalSemaphoreCount = 1;
             submit.pSignalSemaphores = &renderDone_[frame];
         }
+        if (timestamps_)
+        {
+            vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, frame * 2 + 1);
+            timestampsWritten_[frame] = true;
+        }
         vkResetFences(device_, 1, &frameDone_[frame]);
         bool presented = SubmitRecorded(submit, frameDone_[frame]);
 
@@ -693,7 +747,9 @@ namespace hc09::gpu
             present.swapchainCount = 1;
             present.pSwapchains = &swapchain_;
             present.pImageIndices = &index;
+            const auto start = std::chrono::steady_clock::now();
             const VkResult result = vkQueuePresentKHR(queue_, &present);
+            stats_.present += SecondsSince(start);
             // (VK_SUBOPTIMAL_KHR is expected: the swapchain is unrotated in a rotated window and the
             // compositor rotates it. Rebuilding for it would rebuild every frame.)
             if (result == VK_ERROR_OUT_OF_DATE_KHR)

@@ -78,6 +78,10 @@ namespace hc09::debug
     {
         std::lock_guard lock(g_threadsMutex);
         g_threads.emplace_back(pid_t(syscall(SYS_gettid)), guestThreadId);
+        // Named by guest id ("hc09 0xC0" is the command processor) for ps/top/perf.
+        char name[16];
+        std::snprintf(name, sizeof(name), "hc09 0x%X", guestThreadId);
+        pthread_setname_np(pthread_self(), name);
     }
 
     void DumpAllStacks()

@@ -113,6 +113,36 @@ namespace hc09::gpu
         int g_dumpFrame = -1;
         int g_dumpEvery = 0;
 
+        // HC09_GPU_STATS: time per phase of Draw, Resolve and Swap, printed every 2 s in ms per frame
+        // (with the context's waits and the GPU's own frame time).
+        bool g_phaseStats = false;  // (set by ReadOptions)
+        enum PhaseId { kPhaseSetup, kPhasePipeline, kPhaseConstants, kPhaseVertices, kPhaseTextures, kPhaseDescriptors,
+            kPhaseRecord, kPhaseResolve, kPhaseSwap, kPhaseCount };
+        constexpr const char* kPhaseNames[] = { "setup", "pipeline", "constants", "vertices", "textures", "descriptors",
+            "record", "resolve", "swap" };
+        std::chrono::steady_clock::duration g_phaseTime[kPhaseCount]{};
+        std::chrono::steady_clock::time_point g_phaseStart;
+        int g_phase = -1;
+
+        // Ends the running phase (if any) and starts `next` (-1: none).
+        void Phase(int next)
+        {
+            if (!g_phaseStats)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            if (g_phase >= 0)
+                g_phaseTime[g_phase] += now - g_phaseStart;
+            g_phase = next;
+            g_phaseStart = now;
+        }
+
+        // Ends the running phase when the scope does (Draw has many early returns).
+        struct PhaseScope
+        {
+            explicit PhaseScope(int first) { Phase(first); }
+            ~PhaseScope() { Phase(-1); }
+        };
+
         void ReadOptions()
         {
             const char* scale = std::getenv("HC09_RESOLUTION_SCALE");
@@ -121,6 +151,7 @@ namespace hc09::gpu
             g_dumpFrame = spec ? std::atoi(spec) : -1;
             const char* slash = spec ? std::strchr(spec, '/') : nullptr;
             g_dumpEvery = slash ? std::max(std::atoi(slash + 1), 0) : 0;
+            g_phaseStats = std::getenv("HC09_GPU_STATS") != nullptr;
         }
         int g_frame = 0;
         int g_drawInFrame = 0;
@@ -1659,9 +1690,11 @@ namespace hc09::gpu
             const uint32_t mode = ReadRegister(reg::kModeControl) & 7;
             if (mode == kModeCopy)
             {
+                PhaseScope phase(kPhaseResolve);
                 Resolve();
                 return;
             }
+            PhaseScope phase(kPhaseSetup);
             // HC09_SKIP_DRAWS=<n>[,<n>...] (debugging): skip those draws (numbered from 0 in each frame).
             if (static const char* skip = std::getenv("HC09_SKIP_DRAWS"); skip)
             {
@@ -1708,6 +1741,7 @@ namespace hc09::gpu
             ShaderPair* pair = GetShaderPair(vs, ps);
             if (!pair)
                 return;
+            Phase(kPhasePipeline);
             VkPipeline pipeline = GetPipeline(vs, ps, *pair, target.image.format, topology, rectangles && !expandRectangles, colorWrites, samples);
             if (!pipeline)
             {
@@ -1716,6 +1750,7 @@ namespace hc09::gpu
             }
             const VkPhysicalDeviceLimits& limits = context_.properties().limits;
 
+            Phase(kPhaseConstants);
             // Float constants: 2048 big-endian registers, re-uploaded only when they changed.
             const uint32_t* constants = reinterpret_cast<const uint32_t*>(GuestToHost(kRegisterBase + reg::kFloatConstants * 4));
             VulkanContext::Allocation floats;
@@ -1810,6 +1845,7 @@ namespace hc09::gpu
                 state.loopConstants[i] = ReadRegister(reg::kLoopConstants + i);
 
             // Vertex streams: the vertices this draw can reach, byte-swapped into this frame's memory.
+            Phase(kPhaseVertices);
             VkDescriptorBufferInfo streams[kMaxVertexStreams];
             for (auto& stream : streams)
                 stream = { dummyBuffer_, 0, VK_WHOLE_SIZE };
@@ -1882,6 +1918,7 @@ namespace hc09::gpu
             }
 
             // Textures and samplers for every fetch constant either stage samples.
+            Phase(kPhaseTextures);
             const uint32_t textureMask = vs.info.textureFetchMask | ps.info.textureFetchMask;
             const uint32_t cubeMask = vs.info.textureCubeMask | ps.info.textureCubeMask;
             const uint32_t volumeMask = vs.info.textureVolumeMask | ps.info.textureVolumeMask;
@@ -1996,6 +2033,7 @@ namespace hc09::gpu
             }
 
             // The draw's descriptors, for every binding its shaders declare.
+            Phase(kPhaseDescriptors);
             VkDescriptorSet set = context_.AllocateSet(pair->setLayout);
             auto drawState = context_.Allocate(sizeof(DrawState), limits.minUniformBufferOffsetAlignment);
             if (!set || !drawState.cpu)
@@ -2044,6 +2082,7 @@ namespace hc09::gpu
             }
             vkUpdateDescriptorSets(device(), uint32_t(writes.size()), writes.data(), 0, nullptr);
 
+            Phase(kPhaseRecord);
             VulkanContext::Allocation indexUpload{};
             if (indexed)
             {
@@ -2403,6 +2442,7 @@ namespace hc09::gpu
 
         void Renderer::Swap(uint32_t frontBuffer)
         {
+            PhaseScope phase(kPhaseSwap);
             EvictIdleResources(frontBuffer);
             EndPass();
             // New pipelines go to the on-disk cache now and then (every 10 s or so).
@@ -2429,6 +2469,33 @@ namespace hc09::gpu
                     lastFrame = g_frame;
                     lastDraws = draws_;
                     lastSkipped = skippedDraws_;
+                }
+            }
+            // HC09_GPU_STATS: where each frame's time goes, every 2 s.
+            if (g_phaseStats)
+            {
+                static auto last = std::chrono::steady_clock::now();
+                static int lastFrame = g_frame;
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last).count() >= 2.0)
+                {
+                    Phase(kPhaseSwap);  // (books the time so far)
+                    const double frames = std::max(1, g_frame - lastFrame);
+                    const VulkanContext::Stats waits = context_.TakeStats();
+                    double cpu = 0;
+                    std::fprintf(stderr, "[gpu] ms/frame over %.0f frames:", frames);
+                    for (int i = 0; i < kPhaseCount; i++)
+                    {
+                        const double ms = std::chrono::duration<double, std::milli>(g_phaseTime[i]).count() / frames;
+                        cpu += ms;
+                        std::fprintf(stderr, " %s %.2f", kPhaseNames[i], ms);
+                        g_phaseTime[i] = {};
+                    }
+                    std::fprintf(stderr, " = %.1f | inside: acquire %.2f submit %.2f (%.1f/frame) present %.2f fence %.2f | gpu %.1f | %.1f new chunks/frame\n",
+                        cpu, waits.acquire * 1000 / frames, waits.submit * 1000 / frames, waits.submits / frames, waits.present * 1000 / frames,
+                        waits.fence * 1000 / frames, waits.gpuFrames ? waits.gpu * 1000 / waits.gpuFrames : 0.0, waits.chunks / frames);
+                    last = now;
+                    lastFrame = g_frame;
                 }
             }
 
