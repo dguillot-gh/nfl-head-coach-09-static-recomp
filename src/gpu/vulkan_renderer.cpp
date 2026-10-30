@@ -48,6 +48,7 @@
 #include "gpu/shaders.h"
 #include "gpu/vulkan_context.h"
 #include "gpu/vulkan_texture_cache.h"
+#include "gpu/write_watch.h"
 #include "kernel/guest.h"
 #include "memory.h"
 
@@ -729,9 +730,12 @@ namespace hc09::gpu
                 Slab* slab = nullptr;     // the kept copy (null: none)
                 VkDeviceSize offset = 0, size = 0;
                 uint32_t count = 0, maxIndex = 0;  // index buffers: converted indices and the largest
+                bool watched = false;      // its pages are write-watched since watchStamp
+                uint32_t watchStamp = 0;
+                uint32_t changes = 0;      // checks in a row that found new contents
             };
             static constexpr uint32_t kStableAfterFrames = 2;
-            StableData& CheckStable(uint64_t key, const uint8_t* source, uint32_t bytes);
+            StableData& CheckStable(uint64_t key, uint32_t address, uint32_t bytes);
             uint8_t* KeepStable(StableData& data, VkDeviceSize size);
             void ReleaseStable(StableData& data);
             std::vector<std::unique_ptr<Slab>> slabs_;
@@ -1644,7 +1648,7 @@ namespace hc09::gpu
                 const uint32_t sourceBytes = draw.index32 ? draw.indexCount * 4 : ((draw.indexCount + 1) & ~1u) * 2;
                 const uint64_t key[4] = { 2, draw.indexAddress,  // (2: indices)
                     (uint64_t(draw.indexCount) << 8) | (uint64_t(draw.index32) << 4) | uint64_t(draw.indexEndian), uint64_t(draw.primitive) };
-                stable = &CheckStable(XXH3_64bits(key, sizeof(key)), GuestToHost(draw.indexAddress), sourceBytes);
+                stable = &CheckStable(XXH3_64bits(key, sizeof(key)), draw.indexAddress, sourceBytes);
                 if (stable->slab)
                 {
                     stableIndices_ = stable;
@@ -2054,8 +2058,7 @@ namespace hc09::gpu
                 {
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(GuestToHost(address));
                     const uint64_t stableKey[3] = { 1, uploadKey, dwords };  // (1: vertex data)
-                    StableData& stable = CheckStable(XXH3_64bits(stableKey, sizeof(stableKey)), reinterpret_cast<const uint8_t*>(src),
-                        dwords * 4);
+                    StableData& stable = CheckStable(XXH3_64bits(stableKey, sizeof(stableKey)), address, dwords * 4);
                     if (stable.slab)
                     {
                         upload = { stable.slab->chunk.buffer, stable.offset, stable.slab->chunk.cpu + stable.offset };
@@ -2665,25 +2668,55 @@ namespace hc09::gpu
             }
         }
 
-        Renderer::StableData& Renderer::CheckStable(uint64_t key, const uint8_t* source, uint32_t bytes)
+        Renderer::StableData& Renderer::CheckStable(uint64_t key, uint32_t address, uint32_t bytes)
         {
             StableData& data = stableData_[key];
             data.lastUsed = g_frame;
             if (data.checkedFrame == g_frame && data.sourceBytes == bytes)
                 return data;
-            const uint64_t hash = XXH3_64bits(source, bytes);
+            // Physical memory is write-watched: unwritten since the last check means unchanged, with no
+            // hashing. Data that changes at every check (dynamic buffers) is only hashed.
+            static const bool watchBuffers = !std::getenv("HC09_WATCH_NO_BUFFERS");  // (debugging)
+            const bool watchable = watchBuffers && data.changes < 4 && write_watch::Watchable(address, bytes);
+            if (watchable && data.watched && data.sourceBytes == bytes && !write_watch::WrittenSince(address, bytes, data.watchStamp))
+            {
+                // HC09_WATCH_VERIFY=1 (debugging): hash anyway and report changes the watch missed.
+                static const bool verify = std::getenv("HC09_WATCH_VERIFY") != nullptr;
+                if (verify && XXH3_64bits(GuestToHost(address), bytes) != data.hash)
+                {
+                    static int reported = 0;
+                    if (reported++ < 40)
+                        std::fprintf(stderr, "[watch] missed a change: 0x%08X, %u bytes, stamp %u, now %u (frame %d)\n", address, bytes,
+                            data.watchStamp, write_watch::Now(), g_frame);
+                }
+                data.sameFrames++;
+                data.checkedFrame = g_frame;
+                return data;
+            }
+            uint32_t stamp = 0;
+            if (watchable)
+            {
+                stamp = write_watch::Now();
+                write_watch::Watch(address, bytes);  // (before reading, so a write during the hash is noticed)
+            }
+            const uint64_t hash = XXH3_64bits(GuestToHost(address), bytes);
             g_statHashedBytes += bytes;
             if (data.checkedFrame >= 0 && data.sourceBytes == bytes && hash == data.hash)
             {
                 data.sameFrames++;
+                data.changes = 0;
             }
             else
             {
+                if (data.checkedFrame >= 0)
+                    data.changes++;
                 ReleaseStable(data);
                 data.hash = hash;
                 data.sourceBytes = bytes;
                 data.sameFrames = 0;
             }
+            data.watched = watchable;
+            data.watchStamp = stamp;
             data.checkedFrame = g_frame;
             return data;
         }
@@ -2782,10 +2815,10 @@ namespace hc09::gpu
                         waits.fence * 1000 / frames, waits.gpuFrames ? waits.gpu * 1000 / waits.gpuFrames : 0.0, waits.chunks / frames);
                     const VulkanTextureCache::Work work = textures_->TakeWork();
                     std::fprintf(stderr, "[gpu] per frame: textures %.0f looked up, %.2f MB hashed, %.1f uploaded (%.2f MB) | "
-                        "%.0fk indices converted | %.2f MB vertices copied | %.2f MB checked, %zu slabs kept\n", work.lookups / frames,
+                        "%.0fk indices converted | %.2f MB vertices copied | %.2f MB checked, %zu slabs kept | %.0f write faults\n", work.lookups / frames,
                         work.hashedBytes / frames / 1048576.0, work.uploads / frames, work.uploadBytes / frames / 1048576.0,
                         g_statIndices / frames / 1000.0, g_statVertexBytes / frames / 1048576.0, g_statHashedBytes / frames / 1048576.0,
-                        slabs_.size());
+                        slabs_.size(), write_watch::TakeFaults() / frames);
                     g_statIndices = g_statVertexBytes = g_statHashedBytes = 0;
                     last = now;
                     lastFrame = g_frame;

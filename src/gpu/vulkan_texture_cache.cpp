@@ -1,4 +1,5 @@
 #include "gpu/vulkan_texture_cache.h"
+#include "gpu/write_watch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -642,13 +643,31 @@ namespace hc09::gpu
         };
         const int frame = FrameNumber();
         work_.lookups++;
-        // A texture that has never changed since its upload (most of them: 16 MB of hashing a frame in a
-        // game) is checked every 4th frame, spread over textures by address; one that has changed before
-        // (text glyph cache, video) every frame. A first change shows up to 3 frames late.
-        const bool due = entry.rewritten || entry.contentHash == ~0ull || ((uint32_t(frame) + (fetch.baseAddress() >> 12)) & 3) == 0;
-        const bool check = entry.hashedFrame != frame && due;
+        // Memory under write watch is checked every frame at no cost: unwritten since the last check means
+        // unchanged. Without it, a texture that has never changed since its upload (most of them: 16 MB of
+        // hashing a frame in a game) is checked every 4th frame, spread over textures by address; one that
+        // has changed before (text glyph cache, video) every frame. A first change shows up to 3 frames late.
+        const uint32_t guestSource = PhysicalToGuest(fetch.baseAddress()), guestMips = PhysicalToGuest(fetch.mipAddress());
+        static const bool watchTextures = !std::getenv("HC09_WATCH_NO_TEXTURES");  // (debugging)
+        const bool watchable = watchTextures && write_watch::Watchable(guestSource, uint32_t(sourceBytes)) &&
+            (!mipBytes || write_watch::Watchable(guestMips, uint32_t(mipBytes)));
+        const bool due = watchable || entry.rewritten || entry.contentHash == ~0ull ||
+            ((uint32_t(frame) + (fetch.baseAddress() >> 12)) & 3) == 0;
+        bool check = entry.hashedFrame != frame && due;
         entry.hashedFrame = frame;
         uint64_t hash = entry.contentHash;
+        if (check && watchable && entry.watched && !write_watch::WrittenSince(guestSource, uint32_t(sourceBytes), entry.watchStamp) &&
+            !(mipBytes && write_watch::WrittenSince(guestMips, uint32_t(mipBytes), entry.watchStamp)))
+            check = false;  // not written since the last check
+        if (check && watchable)
+        {
+            // Watched before it is read, so a write during the hash is noticed next time.
+            entry.watchStamp = write_watch::Now();
+            write_watch::Watch(guestSource, uint32_t(sourceBytes));
+            if (mipBytes)
+                write_watch::Watch(guestMips, uint32_t(mipBytes));
+        }
+        entry.watched = watchable;
         if (check)
         {
             // Large textures: a sampled hash (64 chunks spread over the base level) at each check,
@@ -657,7 +676,7 @@ namespace hc09::gpu
             // samples miss small updates such as the text glyph cache (a 256x512 texture the game
             // adds each new character to), whose new text would otherwise show other glyphs.
             constexpr uint64_t kFullHashLimit = 256 * 1024, kChunk = 256, kChunks = 64;
-            if (sourceBytes + mipBytes <= kFullHashLimit || (frame / 4) % 15 == int(entry.contentHash % 15) || entry.contentHash == ~0ull ||
+            if (watchable || sourceBytes + mipBytes <= kFullHashLimit || (frame / 4) % 15 == int(entry.contentHash % 15) || entry.contentHash == ~0ull ||
                 entry.rewritten)
             {
                 hash = fullHash();

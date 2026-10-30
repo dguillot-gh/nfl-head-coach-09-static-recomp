@@ -101,6 +101,8 @@ namespace hc09::gpu
             int hashedFrame = -1;      // contents are re-checked at most once per frame
             uint64_t sampledHash = 0;  // large textures: hash of sampled chunks
             bool rewritten = false;    // changed since its first upload: hashed in full every frame
+            bool watched = false;      // its memory is write-watched since watchStamp (then not hashed while unwritten)
+            uint32_t watchStamp = 0;
         };
         void ReleaseEntry(Entry& entry);
 

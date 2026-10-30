@@ -85,7 +85,8 @@ if(HC09_ANDROID_APP)
         ${HC09_ROOT}/src/gpu/hlsl_translator.cpp
         ${HC09_ROOT}/src/gpu/vulkan_context.cpp
         ${HC09_ROOT}/src/gpu/vulkan_renderer.cpp
-        ${HC09_ROOT}/src/gpu/vulkan_texture_cache.cpp)
+        ${HC09_ROOT}/src/gpu/vulkan_texture_cache.cpp
+        ${HC09_ROOT}/src/gpu/write_watch_posix.cpp)
     set(HC09_TARGET hc09)
     target_compile_definitions(hc09 PRIVATE HC09_ANDROID_APP)
     target_link_libraries(hc09 PRIVATE vulkan aaudio OpenSLES)

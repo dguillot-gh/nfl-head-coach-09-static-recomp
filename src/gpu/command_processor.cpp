@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <set>
 #include <tuple>
@@ -230,8 +231,20 @@ namespace hc09::gpu
             uint32_t Read()
             {
                 const uint32_t value = Load<uint32_t>(base_ + index_ * 4);
-                index_ = (index_ + 1) % size_;
+                index_ = index_ + 1 == size_ ? 0 : index_ + 1;
                 return value;
+            }
+            // Copies the next `count` dwords to host memory as they are (big-endian).
+            void CopyTo(uint8_t* dest, uint32_t count)
+            {
+                while (count > 0)
+                {
+                    const uint32_t run = std::min(count, size_ - index_);
+                    std::memcpy(dest, GuestToHost(base_ + index_ * 4), size_t(run) * 4);
+                    dest += size_t(run) * 4;
+                    count -= run;
+                    index_ = (index_ + run) % size_;
+                }
             }
             uint32_t Peek() const { return Load<uint32_t>(base_ + index_ * 4); }
             void Skip(uint32_t count) { index_ = (index_ + count) % size_; }
@@ -283,6 +296,22 @@ namespace hc09::gpu
                 value &= ~0x80000000u;
             }
             WriteRegister(index, value);
+        }
+
+        // `count` registers from the stream, starting at `index`. Blocks without a register that has a
+        // side effect (most: constants, state) are copied as they are, since the ring and the register
+        // file both hold big-endian dwords: games write ~700k registers a frame.
+        void WriteRegistersFromStream(Reader& reader, uint32_t index, uint32_t count)
+        {
+            const bool sideEffects = (index < kScratchReg0 + 8 && index + count > kScratchReg0) ||
+                (index <= kCoherStatusHost && index + count > kCoherStatusHost);
+            if (sideEffects || uint64_t(index) + count > kRegisterCount)
+            {
+                for (uint32_t i = 0; i < count; i++)
+                    WriteRegisterFromStream(index + i, reader.Read());
+                return;
+            }
+            reader.CopyTo(GuestToHost(kRegisterBase + index * 4), count);
         }
 
         // Packet statistics, printed every 2 seconds when HC09_GPU_STATS is set.
@@ -567,24 +596,26 @@ namespace hc09::gpu
                 const uint32_t index = ConstantIndex(reader.Read());
                 const uint32_t size = reader.Read() & 0xFFF;
                 reader.Skip(count - 3);
-                for (uint32_t i = 0; i < size; i++)
-                    WriteRegister(index + i, Load<uint32_t>(address + i * 4));
+                // (Both big-endian: copied as they are.)
+                if (uint64_t(index) + size <= kRegisterCount)
+                    std::memcpy(GuestToHost(kRegisterBase + index * 4), GuestToHost(address), size_t(size) * 4);
+                else
+                    for (uint32_t i = 0; i < size; i++)
+                        WriteRegister(index + i, Load<uint32_t>(address + i * 4));
                 break;
             }
             case pm4::kSetConstant:
             {
                 // (type << 16 | offset, values...)
                 const uint32_t index = ConstantIndex(reader.Read());
-                for (uint32_t i = 1; i < count; i++)
-                    WriteRegisterFromStream(index + i - 1, reader.Read());
+                WriteRegistersFromStream(reader, index, count - 1);
                 break;
             }
             case pm4::kSetConstant2:
             {
                 // (register index, values...)
                 const uint32_t index = reader.Read() & 0xFFFF;
-                for (uint32_t i = 1; i < count; i++)
-                    WriteRegisterFromStream(index + i - 1, reader.Read());
+                WriteRegistersFromStream(reader, index, count - 1);
                 break;
             }
             case pm4::kDrawIndx:
@@ -677,8 +708,15 @@ namespace hc09::gpu
                         std::fprintf(stderr, "[packet] type0 registers 0x%04X x%u\n", baseIndex, count);
                     const bool oneRegister = (header >> 15) & 1;
                     g_type0Writes += count;
-                    for (uint32_t i = 0; i < count; i++)
-                        WriteRegisterFromStream(oneRegister ? baseIndex : baseIndex + i, reader.Read());
+                    if (oneRegister)
+                    {
+                        for (uint32_t i = 0; i < count; i++)
+                            WriteRegisterFromStream(baseIndex, reader.Read());
+                    }
+                    else
+                    {
+                        WriteRegistersFromStream(reader, baseIndex, count);
+                    }
                     break;
                 }
                 case 1:  // two registers
