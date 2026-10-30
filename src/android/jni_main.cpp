@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -110,6 +111,9 @@ namespace
                     g_windowChanged.wait(lock, [&] { return g_takeOver || g_windowGeneration != generation; });
                 if (g_takeOver)
                 {
+                    // Black for whatever shows until the renderer's first frame (the shader pre-compile).
+                    if (haveWindow)
+                        context.ClearAndPresent(0.0f, 0.0f, 0.0f);
                     context.Shutdown();
                     g_renderThreadDone = true;
                     g_windowChanged.notify_all();
@@ -201,6 +205,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_startGame(JN
     // The renderer keeps the driver's compiled pipelines next to the user data (the app's files folder).
     const std::string files = args->userData.substr(0, args->userData.find_last_of('/'));
     setenv("HC09_PIPELINE_CACHE", (files + "/vulkan_pipelines.bin").c_str(), 0);
+    setenv("HC09_PIPELINE_LIST", (files + "/pipelines.txt").c_str(), 0);
     // The recompiled code runs deep on the guest main thread; give it the stack a desktop main thread has.
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
@@ -238,6 +243,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_hc09_recomp_NativeBridge_setPad(JNIEn
     pad.sThumbRX = SHORT(rightX);
     pad.sThumbRY = SHORT(rightY);
     hc09::host::SetHostPad(true, pad);
+}
+
+// The pipeline pre-compile's progress as done << 16 | total, or -1 when it is not running.
+extern "C" JNIEXPORT jint JNICALL Java_com_hc09_recomp_NativeBridge_shaderProgress(JNIEnv*, jclass)
+{
+    int done = 0, total = 0;
+    if (!hc09::gpu::PrecompileProgress(done, total))
+        return -1;
+    return (std::min(done, 0x7FFF) << 16) | std::min(total, 0xFFFF);
 }
 
 // Frames the game has presented so far (the menu's frame-rate counter).

@@ -38,7 +38,25 @@ public class GameActivity extends Activity implements SurfaceHolder.Callback, Xb
     private GameMenu menu;
     private SharedPreferences prefs;
     private TextView fps;
+    private TextView shaders;  // "Preparing shaders" while the renderer pre-compiles its pipelines
     private final Handler handler = new Handler(Looper.getMainLooper());
+
+    // The renderer pre-compiles every pipeline seen before (the game waits meanwhile): its progress.
+    private final Runnable shaderTick = new Runnable() {
+        @Override
+        public void run() {
+            final int progress = NativeBridge.shaderProgress();
+            if (progress < 0) {
+                shaders.setVisibility(View.GONE);
+            } else {
+                shaders.setText(String.format(java.util.Locale.US,
+                        "Preparing shaders  %d / %d",
+                        progress >>> 16, progress & 0xFFFF));
+                shaders.setVisibility(View.VISIBLE);
+            }
+            handler.postDelayed(this, 250);
+        }
+    };
     private int lastFrame;
     private long lastFpsTime;
 
@@ -66,9 +84,19 @@ public class GameActivity extends Activity implements SurfaceHolder.Callback, Xb
         fps.setPadding(12, 4, 12, 4);
         root.addView(fps, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+        shaders = new TextView(this);
+        shaders.setTextColor(Color.WHITE);
+        shaders.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        shaders.setGravity(Gravity.CENTER);
+        shaders.setBackgroundColor(0xC0000000);
+        shaders.setPadding(48, 28, 48, 28);
+        shaders.setVisibility(View.GONE);
+        root.addView(shaders, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
         setContentView(root);
         menu = new GameMenu(this, pad, prefs, this::updateFps, this::finish);
         updateFps();
+        handler.post(shaderTick);
         hideSystemBars();
         NativeBridge.setAssetManager(getAssets());
         startGameIfPossible();

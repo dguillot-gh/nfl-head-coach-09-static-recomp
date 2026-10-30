@@ -332,6 +332,259 @@ namespace hc09::gpu
             return VK_DESCRIPTOR_TYPE_SAMPLER;
         }
 
+        // A pipeline as the renderer builds it: the shader pair and the render state it depends on. The
+        // pre-compiler replays these from a list (pipelines.txt), so they are plain numbers.
+        struct PipelineDesc
+        {
+            uint64_t vs = 0, ps = 0;  // microcode hashes
+            uint32_t depthControl = 0, stencilMasks = 0, cull = 0;
+            uint32_t polyOffsetEnable = 0, polyScale = 0, polyOffset = 0;
+            uint32_t blend = 0, writeMask = 0, clipDisabled = 0;
+            uint32_t format = 0, topology = 0, rectangles = 0, samples = 1;
+            uint32_t pad = 0;
+
+            uint64_t Key() const { return XXH3_64bits(this, sizeof(*this)); }
+
+            std::string ToLine() const
+            {
+                char line[256];
+                std::snprintf(line, sizeof(line), "%016llX %016llX %X %X %X %X %X %X %X %X %X %X %X %X %X\n", (unsigned long long)vs,
+                    (unsigned long long)ps, depthControl, stencilMasks, cull, polyOffsetEnable, polyScale, polyOffset, blend, writeMask,
+                    clipDisabled, format, topology, rectangles, samples);
+                return line;
+            }
+
+            bool FromLine(const char* line)
+            {
+                unsigned long long v = 0, p = 0;
+                const int fields = std::sscanf(line, "%llX %llX %X %X %X %X %X %X %X %X %X %X %X %X %X", &v, &p, &depthControl,
+                    &stencilMasks, &cull, &polyOffsetEnable, &polyScale, &polyOffset, &blend, &writeMask, &clipDisabled, &format,
+                    &topology, &rectangles, &samples);
+                vs = v;
+                ps = p;
+                pad = 0;
+                return fields == 15;
+            }
+        };
+        static_assert(sizeof(PipelineDesc) == 72);  // no padding: hashed as bytes
+
+        // A pipeline's create info with everything it points to, so it can be built on another thread.
+        struct PipelineBuild
+        {
+            VkPipelineShaderStageCreateInfo stages[3];
+            VkPipelineVertexInputStateCreateInfo vertexInput;
+            VkPipelineInputAssemblyStateCreateInfo assembly;
+            VkPipelineViewportStateCreateInfo viewport;
+            VkPipelineRasterizationStateCreateInfo raster;
+            VkPipelineMultisampleStateCreateInfo multisample;
+            VkPipelineDepthStencilStateCreateInfo ds;
+            VkPipelineColorBlendAttachmentState target;
+            VkPipelineColorBlendStateCreateInfo blendState;
+            VkDynamicState dynamicStates[4];
+            VkPipelineDynamicStateCreateInfo dynamic;
+            VkGraphicsPipelineCreateInfo info;
+            PipelineDesc desc;
+            std::chrono::steady_clock::time_point start;
+            std::mutex mutex;
+            std::condition_variable finished;
+            bool done = false;
+            VkResult result = VK_INCOMPLETE;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+        };
+
+        // Fills `build` to make the pipeline `desc` describes (pointers into `build` itself).
+        void FillPipeline(const PipelineDesc& desc, VkShaderModule vs, VkShaderModule ps, VkShaderModule gs, VkPipelineLayout layout,
+            VkRenderPass renderPass, bool depthClamp, bool blendable, PipelineBuild& build)
+        {
+            uint32_t stageCount = 0;
+            build.stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+                vs, "main", nullptr };
+            if (desc.rectangles)
+                build.stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT,
+                    gs, "rectangle_gs", nullptr };
+            build.stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+                ps, "main", nullptr };
+
+            build.vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+            build.assembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+            const auto topology = VkPrimitiveTopology(desc.topology);
+            build.assembly.topology = topology;
+            build.assembly.primitiveRestartEnable =
+                topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            build.viewport = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+            build.viewport.viewportCount = build.viewport.scissorCount = 1;
+
+            auto& raster = build.raster;
+            raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+            raster.polygonMode = VK_POLYGON_MODE_FILL;
+            raster.lineWidth = 1.0f;
+            // PA_SU_SC_MODE_CNTL: cull_front (bit 0), cull_back (bit 1), face (bit 2: 1 = CW is front).
+            // Positions reach the framebuffer as on D3D12 (same screen-space winding), so the mapping is too.
+            const uint32_t cull = desc.cull;
+            raster.cullMode = (cull & 3) == 1 ? VK_CULL_MODE_FRONT_BIT : (cull & 3) == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+            raster.frontFace = (cull & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            raster.depthClampEnable = desc.clipDisabled && depthClamp;
+            if (desc.polyOffsetEnable)
+            {
+                float scale, offset;
+                std::memcpy(&scale, &desc.polyScale, 4);
+                std::memcpy(&offset, &desc.polyOffset, 4);
+                raster.depthBiasEnable = VK_TRUE;
+                raster.depthBiasSlopeFactor = scale / 16.0f;
+                // Rounded away from zero so a small offset still separates the layers.
+                const float units = offset * 16777216.0f;
+                raster.depthBiasConstantFactor = units < 0 ? std::floor(units) : std::ceil(units);
+            }
+            build.multisample = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+            build.multisample.rasterizationSamples = VkSampleCountFlagBits(desc.samples);
+
+            // RB_DEPTHCONTROL: stencil enable (0), z enable (1), z write (2), z func (4-6),
+            // backface stencil enable (7), front stencil func/fail/zpass/zfail (8-19), back (20-31).
+            // Xenos compare functions and stencil ops are Vulkan's enums.
+            const uint32_t depthControl = desc.depthControl, stencilMasks = desc.stencilMasks;
+            auto& ds = build.ds;
+            ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+            ds.depthTestEnable = (depthControl >> 1) & 1;
+            static const bool noDepthTest = std::getenv("HC09_NO_DEPTH_TEST") != nullptr;  // debugging
+            if (noDepthTest)
+                ds.depthTestEnable = VK_FALSE;
+            ds.depthWriteEnable = ds.depthTestEnable && ((depthControl >> 2) & 1);
+            ds.depthCompareOp = VkCompareOp((depthControl >> 4) & 7);
+            ds.stencilTestEnable = depthControl & 1;
+            auto face = [&](uint32_t shift) {
+                VkStencilOpState op{};
+                op.compareOp = VkCompareOp((depthControl >> shift) & 7);
+                op.failOp = VkStencilOp((depthControl >> (shift + 3)) & 7);
+                op.passOp = VkStencilOp((depthControl >> (shift + 6)) & 7);
+                op.depthFailOp = VkStencilOp((depthControl >> (shift + 9)) & 7);
+                op.compareMask = (stencilMasks >> 8) & 0xFF;
+                op.writeMask = (stencilMasks >> 16) & 0xFF;
+                return op;
+            };
+            ds.front = face(8);
+            ds.back = ((depthControl >> 7) & 1) ? face(20) : ds.front;
+
+            auto& target = build.target;
+            target = {};
+            const uint32_t blend = desc.blend;
+            const uint32_t srcColor = blend & 0x1F, colorOp = (blend >> 5) & 7, dstColor = (blend >> 8) & 0x1F;
+            const uint32_t srcAlpha = (blend >> 16) & 0x1F, alphaOp = (blend >> 21) & 7, dstAlpha = (blend >> 24) & 0x1F;
+            target.blendEnable = !(srcColor == 1 && dstColor == 0 && colorOp == 0 && srcAlpha == 1 && dstAlpha == 0 && alphaOp == 0);
+            // Formats that cannot blend (some float targets) draw unblended.
+            if (!blendable)
+                target.blendEnable = VK_FALSE;
+            target.srcColorBlendFactor = BlendFactor(srcColor, false);
+            target.dstColorBlendFactor = BlendFactor(dstColor, false);
+            target.colorBlendOp = BlendOp(colorOp);
+            target.srcAlphaBlendFactor = BlendFactor(srcAlpha, true);
+            target.dstAlphaBlendFactor = BlendFactor(dstAlpha, true);
+            target.alphaBlendOp = BlendOp(alphaOp);
+            target.colorWriteMask = desc.writeMask;
+            build.blendState = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+            build.blendState.attachmentCount = 1;
+            build.blendState.pAttachments = &build.target;
+
+            const VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+            std::copy(std::begin(dynamicStates), std::end(dynamicStates), build.dynamicStates);
+            build.dynamic = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+            build.dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
+            build.dynamic.pDynamicStates = build.dynamicStates;
+
+            auto& info = build.info;
+            info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+            info.stageCount = stageCount;
+            info.pStages = build.stages;
+            info.pVertexInputState = &build.vertexInput;
+            info.pInputAssemblyState = &build.assembly;
+            info.pViewportState = &build.viewport;
+            info.pRasterizationState = &build.raster;
+            info.pMultisampleState = &build.multisample;
+            info.pDepthStencilState = &build.ds;
+            info.pColorBlendState = &build.blendState;
+            info.pDynamicState = &build.dynamic;
+            info.layout = layout;
+            info.renderPass = renderPass;
+            build.desc = desc;
+        }
+
+        // At most this many pipelines are compiled at once by the game's draws (the compiler shares the
+        // CPU with the game).
+        class BuildSlots
+        {
+        public:
+            void Acquire()
+            {
+                std::unique_lock lock(mutex_);
+                free_.wait(lock, [this] { return used_ < 3; });
+                used_++;
+            }
+            void Release()
+            {
+                std::lock_guard lock(mutex_);
+                used_--;
+                free_.notify_one();
+            }
+
+        private:
+            std::mutex mutex_;
+            std::condition_variable free_;
+            int used_ = 0;
+        };
+        BuildSlots g_buildSlots;
+
+        // Pre-compile progress for the app's "Preparing shaders" screen (total 0: not running).
+        std::atomic<int> g_precompileTotal{ 0 }, g_precompileDone{ 0 };
+
+        // A file of the APK's assets (null when missing).
+        bool ReadAsset(const char* path, std::vector<uint8_t>& data)
+        {
+            AAsset* asset = android::Assets() ? AAssetManager_open(android::Assets(), path, AASSET_MODE_BUFFER) : nullptr;
+            if (!asset)
+                return false;
+            data.resize(size_t(AAsset_getLength(asset)));
+            const bool read = AAsset_read(asset, data.data(), data.size()) == int(data.size());
+            AAsset_close(asset);
+            return read;
+        }
+
+        // A colour + depth/stencil render pass that loads and stores both (null on failure, logged).
+        VkRenderPass MakeRenderPass(VkDevice device, VkFormat format, uint32_t samples, VkFormat depthFormat)
+        {
+            VkAttachmentDescription attachments[2]{};
+            attachments[0].format = format;
+            attachments[0].samples = VkSampleCountFlagBits(samples);
+            attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachments[0].initialLayout = attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            attachments[1].format = depthFormat;
+            attachments[1].samples = VkSampleCountFlagBits(samples);
+            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+            attachments[1].initialLayout = attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference color{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+            VkAttachmentReference depth{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 1;
+            subpass.pColorAttachments = &color;
+            subpass.pDepthStencilAttachment = &depth;
+            VkRenderPassCreateInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+            info.attachmentCount = 2;
+            info.pAttachments = attachments;
+            info.subpassCount = 1;
+            info.pSubpasses = &subpass;
+            VkRenderPass pass = VK_NULL_HANDLE;
+            if (vkCreateRenderPass(device, &info, nullptr, &pass) != VK_SUCCESS)
+            {
+                std::fprintf(stderr, "[gpu] render pass creation failed (format %d)\n", int(format));
+                return VK_NULL_HANDLE;
+            }
+            return pass;
+        }
+
         // The descriptor set and pipeline layouts of a vertex + pixel shader pair.
         struct ShaderPair
         {
@@ -417,32 +670,13 @@ namespace hc09::gpu
             std::unordered_map<uint64_t, ShaderPair> shaderPairs_;
             std::unordered_map<uint64_t, VkPipeline> pipelines_;
             std::set<uint64_t> failedPairs_;  // shader pairs whose pipelines the driver refused
-            // A pipeline being built on a worker thread (GetPipeline).
-            struct PipelineBuild
-            {
-                VkPipelineShaderStageCreateInfo stages[3];
-                VkPipelineVertexInputStateCreateInfo vertexInput;
-                VkPipelineInputAssemblyStateCreateInfo assembly;
-                VkPipelineViewportStateCreateInfo viewport;
-                VkPipelineRasterizationStateCreateInfo raster;
-                VkPipelineMultisampleStateCreateInfo multisample;
-                VkPipelineDepthStencilStateCreateInfo ds;
-                VkPipelineColorBlendAttachmentState target;
-                VkPipelineColorBlendStateCreateInfo blendState;
-                VkDynamicState dynamicStates[4];
-                VkPipelineDynamicStateCreateInfo dynamic;
-                VkGraphicsPipelineCreateInfo info;
-                uint64_t vsHash = 0, psHash = 0;
-                bool rectangles = false;
-                std::chrono::steady_clock::time_point start;
-                std::mutex mutex;
-                std::condition_variable finished;
-                bool done = false;
-                VkResult result = VK_INCOMPLETE;
-                VkPipeline pipeline = VK_NULL_HANDLE;
-            };
             std::unordered_map<uint64_t, std::shared_ptr<PipelineBuild>> pendingPipelines_;
             VkPipeline FinishPipeline(uint64_t key, uint64_t pairKey, PipelineBuild& build);
+            // Pipelines seen so far (this phone's list, HC09_PIPELINE_LIST, plus the APK's pipelines.txt):
+            // built in the background at start, so the driver's cache has them before the game asks.
+            void StartPrecompile();
+            void RecordPipeline(const PipelineDesc& desc);
+            std::set<uint64_t> recordedPipelines_;
             bool pipelinesAdded_ = false;  // since the pipeline cache was last saved
             std::map<std::pair<VkFormat, uint32_t>, VkRenderPass> renderPasses_;
             std::map<std::pair<VkImageView, VkImageView>, VkFramebuffer> framebuffers_;
@@ -485,7 +719,10 @@ namespace hc09::gpu
             depthSampleable_ = context_.SupportsFormat(depthFormat_, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
             std::fprintf(stderr, "[gpu] Vulkan renderer: depth format %d (sampled %d), resolution scale %u\n", int(depthFormat_),
                 int(depthSampleable_), g_scale);
-            return CreateBuiltins();
+            if (!CreateBuiltins())
+                return false;
+            StartPrecompile();
+            return true;
         }
 
         bool Renderer::CreateImage(Image& image, VkFormat format, uint32_t width, uint32_t height, VkImageUsageFlags usage,
@@ -817,35 +1054,8 @@ namespace hc09::gpu
         VkRenderPass Renderer::GetRenderPass(VkFormat format, uint32_t samples)
         {
             VkRenderPass& pass = renderPasses_[{ format, samples }];
-            if (pass)
-                return pass;
-            VkAttachmentDescription attachments[2]{};
-            attachments[0].format = format;
-            attachments[0].samples = VkSampleCountFlagBits(samples);
-            attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachments[0].initialLayout = attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            attachments[1].format = depthFormat_;
-            attachments[1].samples = VkSampleCountFlagBits(samples);
-            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachments[1].initialLayout = attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            VkAttachmentReference color{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-            VkAttachmentReference depth{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-            VkSubpassDescription subpass{};
-            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-            subpass.colorAttachmentCount = 1;
-            subpass.pColorAttachments = &color;
-            subpass.pDepthStencilAttachment = &depth;
-            VkRenderPassCreateInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-            info.attachmentCount = 2;
-            info.pAttachments = attachments;
-            info.subpassCount = 1;
-            info.pSubpasses = &subpass;
-            if (vkCreateRenderPass(device(), &info, nullptr, &pass) != VK_SUCCESS)
-                std::fprintf(stderr, "[gpu] render pass creation failed (format %d)\n", int(format));
+            if (!pass)
+                pass = MakeRenderPass(device(), format, samples, depthFormat_);
             return pass;
         }
 
@@ -961,36 +1171,36 @@ namespace hc09::gpu
         VkPipeline Renderer::GetPipeline(const CompiledShader& vs, const CompiledShader& ps, const ShaderPair& pair, VkFormat format,
             VkPrimitiveTopology topology, bool rectangles, bool colorWrites, uint32_t samples)
         {
-            const uint32_t depthControl = ReadRegister(reg::kDepthControl);
-            const uint32_t stencilMasks = ReadRegister(reg::kStencilRefMask) & 0xFFFF00;
-            const uint32_t cull = ReadRegister(reg::kScModeControl) & 7;
+            PipelineDesc desc;
+            desc.vs = ActiveShader(ShaderType::Vertex)->hash;
+            desc.ps = ActiveShader(ShaderType::Pixel)->hash;
+            desc.depthControl = ReadRegister(reg::kDepthControl);
+            desc.stencilMasks = ReadRegister(reg::kStencilRefMask) & 0xFFFF00;
+            desc.cull = ReadRegister(reg::kScModeControl) & 7;
             // Polygon offset: PA_SU_SC_MODE_CNTL poly_offset_front_enable (bit 11) / back (bit 12), with
             // PA_SU_POLY_OFFSET_FRONT_SCALE/OFFSET (0x2380/1) and BACK (0x2382/3). The title draws layers
             // over the field with it; without it they depth-fight the turf. One bias serves both faces,
             // so the front's is taken when enabled. The scale is in 1/16 pixel units; the offset in
             // depth units, which Vulkan takes as a count of 2^-24 for the D24 buffer.
-            const uint32_t polyOffsetEnable = (ReadRegister(reg::kScModeControl) >> 11) & 3;
-            uint32_t polyScale = 0, polyOffset = 0;
-            if (polyOffsetEnable)
+            desc.polyOffsetEnable = (ReadRegister(reg::kScModeControl) >> 11) & 3;
+            if (desc.polyOffsetEnable)
             {
-                const uint32_t base = (polyOffsetEnable & 1) ? reg::kPolyOffsetFront : reg::kPolyOffsetFront + 2;
-                polyScale = ReadRegister(base);
-                polyOffset = ReadRegister(base + 1);
+                const uint32_t base = (desc.polyOffsetEnable & 1) ? reg::kPolyOffsetFront : reg::kPolyOffsetFront + 2;
+                desc.polyScale = ReadRegister(base);
+                desc.polyOffset = ReadRegister(base + 1);
             }
-            const uint32_t blend = ReadRegister(reg::kBlendControl0);
-            const uint32_t writeMask = colorWrites ? ReadRegister(reg::kColorMask) & 0xF : 0;
-            uint64_t key = Mix(0, reinterpret_cast<uintptr_t>(&vs));
-            key = Mix(key, (uint64_t(depthControl) << 32) | (uint64_t(stencilMasks) << 3) | cull);
-            key = Mix(key, reinterpret_cast<uintptr_t>(&ps));
-            key = Mix(key, (uint64_t(format) << 40) | (uint64_t(topology) << 32) | blend);
+            desc.blend = ReadRegister(reg::kBlendControl0);
+            desc.writeMask = colorWrites ? ReadRegister(reg::kColorMask) & 0xF : 0;
             // PA_CL_CLIP_CNTL bit 16: clip_disable (no clipping, so no depth clipping either).
-            const bool clipDisabled = (ReadRegister(0x2204) >> 16) & 1;
-            key = Mix(key, (uint64_t(clipDisabled) << 24) | (uint64_t(samples) << 16) | (uint64_t(rectangles) << 8) | writeMask);
-            if (polyOffsetEnable)
-                key = Mix(key, (uint64_t(polyScale) << 32) | polyOffset);
+            desc.clipDisabled = (ReadRegister(0x2204) >> 16) & 1;
+            desc.format = uint32_t(format);
+            desc.topology = uint32_t(topology);
+            desc.rectangles = rectangles;
+            desc.samples = samples;
+            const uint64_t key = desc.Key();
             // A shader pair the driver could not build a pipeline for (the V30's gives up on some large
             // shaders with VK_INCOMPLETE, after a long try) is not tried again: its draws are skipped.
-            const uint64_t pairKey = Mix(reinterpret_cast<uintptr_t>(&vs), reinterpret_cast<uintptr_t>(&ps));
+            const uint64_t pairKey = Mix(desc.vs, desc.ps);
             if (failedPairs_.count(pairKey))
                 return VK_NULL_HANDLE;
             if (auto found = pipelines_.find(key); found != pipelines_.end())
@@ -1008,141 +1218,20 @@ namespace hc09::gpu
                 return FinishPipeline(key, pairKey, *build);
             }
 
-            VkPipelineShaderStageCreateInfo stages[3]{};
-            uint32_t stageCount = 0;
-            stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
-                vs.module, "main", nullptr };
-            if (rectangles)
-                stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT,
-                    rectangleGs_, "rectangle_gs", nullptr };
-            stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
-                ps.module, "main", nullptr };
-
-            VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-            VkPipelineInputAssemblyStateCreateInfo assembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            assembly.topology = topology;
-            assembly.primitiveRestartEnable =
-                topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-            VkPipelineViewportStateCreateInfo viewport{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            viewport.viewportCount = viewport.scissorCount = 1;
-
-            VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            raster.polygonMode = VK_POLYGON_MODE_FILL;
-            raster.lineWidth = 1.0f;
-            // PA_SU_SC_MODE_CNTL: cull_front (bit 0), cull_back (bit 1), face (bit 2: 1 = CW is front).
-            // Positions reach the framebuffer as on D3D12 (same screen-space winding), so the mapping is too.
-            raster.cullMode = (cull & 3) == 1 ? VK_CULL_MODE_FRONT_BIT : (cull & 3) == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
-            raster.frontFace = (cull & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-            raster.depthClampEnable = clipDisabled && context_.features().depthClamp;
-            if (polyOffsetEnable)
-            {
-                float scale, offset;
-                std::memcpy(&scale, &polyScale, 4);
-                std::memcpy(&offset, &polyOffset, 4);
-                raster.depthBiasEnable = VK_TRUE;
-                raster.depthBiasSlopeFactor = scale / 16.0f;
-                // Rounded away from zero so a small offset still separates the layers.
-                const float units = offset * 16777216.0f;
-                raster.depthBiasConstantFactor = units < 0 ? std::floor(units) : std::ceil(units);
-            }
-            VkPipelineMultisampleStateCreateInfo multisample{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
-
-            // RB_DEPTHCONTROL: stencil enable (0), z enable (1), z write (2), z func (4-6),
-            // backface stencil enable (7), front stencil func/fail/zpass/zfail (8-19), back (20-31).
-            // Xenos compare functions and stencil ops are Vulkan's enums.
-            VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-            ds.depthTestEnable = (depthControl >> 1) & 1;
-            static const bool noDepthTest = std::getenv("HC09_NO_DEPTH_TEST") != nullptr;  // debugging
-            if (noDepthTest)
-                ds.depthTestEnable = VK_FALSE;
-            ds.depthWriteEnable = ds.depthTestEnable && ((depthControl >> 2) & 1);
-            ds.depthCompareOp = VkCompareOp((depthControl >> 4) & 7);
-            ds.stencilTestEnable = depthControl & 1;
-            auto face = [&](uint32_t shift) {
-                VkStencilOpState op{};
-                op.compareOp = VkCompareOp((depthControl >> shift) & 7);
-                op.failOp = VkStencilOp((depthControl >> (shift + 3)) & 7);
-                op.passOp = VkStencilOp((depthControl >> (shift + 6)) & 7);
-                op.depthFailOp = VkStencilOp((depthControl >> (shift + 9)) & 7);
-                op.compareMask = (stencilMasks >> 8) & 0xFF;
-                op.writeMask = (stencilMasks >> 16) & 0xFF;
-                return op;
-            };
-            ds.front = face(8);
-            ds.back = ((depthControl >> 7) & 1) ? face(20) : ds.front;
-
-            VkPipelineColorBlendAttachmentState target{};
-            const uint32_t srcColor = blend & 0x1F, colorOp = (blend >> 5) & 7, dstColor = (blend >> 8) & 0x1F;
-            const uint32_t srcAlpha = (blend >> 16) & 0x1F, alphaOp = (blend >> 21) & 7, dstAlpha = (blend >> 24) & 0x1F;
-            target.blendEnable = !(srcColor == 1 && dstColor == 0 && colorOp == 0 && srcAlpha == 1 && dstAlpha == 0 && alphaOp == 0);
-            // Formats that cannot blend (some float targets) draw unblended.
-            if (target.blendEnable && !context_.SupportsFormat(format, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))
-                target.blendEnable = VK_FALSE;
-            target.srcColorBlendFactor = BlendFactor(srcColor, false);
-            target.dstColorBlendFactor = BlendFactor(dstColor, false);
-            target.colorBlendOp = BlendOp(colorOp);
-            target.srcAlphaBlendFactor = BlendFactor(srcAlpha, true);
-            target.dstAlphaBlendFactor = BlendFactor(dstAlpha, true);
-            target.alphaBlendOp = BlendOp(alphaOp);
-            target.colorWriteMask = writeMask;
-            VkPipelineColorBlendStateCreateInfo blendState{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            blendState.attachmentCount = 1;
-            blendState.pAttachments = &target;
-
-            const VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS };
-            VkPipelineDynamicStateCreateInfo dynamic{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
-            dynamic.pDynamicStates = dynamicStates;
-
-            VkGraphicsPipelineCreateInfo info{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            info.stageCount = stageCount;
-            info.pStages = stages;
-            info.pVertexInputState = &vertexInput;
-            info.pInputAssemblyState = &assembly;
-            info.pViewportState = &viewport;
-            info.pRasterizationState = &raster;
-            info.pMultisampleState = &multisample;
-            info.pDepthStencilState = &ds;
-            info.pColorBlendState = &blendState;
-            info.pDynamicState = &dynamic;
-            info.layout = pair.layout;
-            info.renderPass = GetRenderPass(format, samples);
             // Built on its own thread: some of the game's largest shaders take the Pixel 8's compiler
             // 10-60 s (51ADA21A38FAF13D.ps, C0DEA8AD11DC6C29.ps). The draw waits a little (most builds
             // take well under that); past it, the pipeline's draws are skipped until the build is done.
+            // Listed for the next start's pre-compile as soon as it is asked for (the slowest may never finish now).
+            RecordPipeline(desc);
             auto build = std::make_shared<PipelineBuild>();
-            std::copy(std::begin(stages), std::end(stages), build->stages);
-            build->vertexInput = vertexInput;
-            build->assembly = assembly;
-            build->viewport = viewport;
-            build->raster = raster;
-            build->multisample = multisample;
-            build->ds = ds;
-            build->target = target;
-            build->blendState = blendState;
-            build->blendState.pAttachments = &build->target;
-            std::copy(std::begin(dynamicStates), std::end(dynamicStates), build->dynamicStates);
-            build->dynamic = dynamic;
-            build->dynamic.pDynamicStates = build->dynamicStates;
-            build->info = info;
-            build->info.pStages = build->stages;
-            build->info.pVertexInputState = &build->vertexInput;
-            build->info.pInputAssemblyState = &build->assembly;
-            build->info.pViewportState = &build->viewport;
-            build->info.pRasterizationState = &build->raster;
-            build->info.pMultisampleState = &build->multisample;
-            build->info.pDepthStencilState = &build->ds;
-            build->info.pColorBlendState = &build->blendState;
-            build->info.pDynamicState = &build->dynamic;
-            build->vsHash = ActiveShader(ShaderType::Vertex)->hash;
-            build->psHash = ActiveShader(ShaderType::Pixel)->hash;
-            build->rectangles = rectangles;
+            FillPipeline(desc, vs.module, ps.module, rectangleGs_, pair.layout, GetRenderPass(format, samples), context_.features().depthClamp,
+                context_.SupportsFormat(format, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT), *build);
             build->start = std::chrono::steady_clock::now();
             std::thread([build, device = device(), cache = context_.pipelineCache()] {
                 VkPipeline built = VK_NULL_HANDLE;
+                g_buildSlots.Acquire();
                 const VkResult result = vkCreateGraphicsPipelines(device, cache, 1, &build->info, nullptr, &built);
+                g_buildSlots.Release();
                 std::lock_guard lock(build->mutex);
                 build->result = result;
                 build->pipeline = built;
@@ -1151,10 +1240,10 @@ namespace hc09::gpu
             }).detach();
             {
                 std::unique_lock lock(build->mutex);
-                if (!build->finished.wait_for(lock, std::chrono::milliseconds(300), [&] { return build->done; }))
+                if (!build->finished.wait_for(lock, std::chrono::milliseconds(100), [&] { return build->done; }))
                 {
-                    std::fprintf(stderr, "[gpu] frame %d: pipeline still building after 300 ms, continuing without it (vs %016llX ps %016llX)\n",
-                        g_frame, (unsigned long long)build->vsHash, (unsigned long long)build->psHash);
+                    std::fprintf(stderr, "[gpu] frame %d: pipeline still building after 100 ms, continuing without it (vs %016llX ps %016llX)\n",
+                        g_frame, (unsigned long long)desc.vs, (unsigned long long)desc.ps);
                     pendingPipelines_[key] = build;
                     return VK_NULL_HANDLE;
                 }
@@ -1168,15 +1257,177 @@ namespace hc09::gpu
             if (build.result != VK_SUCCESS)
             {
                 std::fprintf(stderr, "[gpu] pipeline creation failed (%d): vs %016llX ps %016llX\n", int(build.result),
-                    (unsigned long long)build.vsHash, (unsigned long long)build.psHash);
+                    (unsigned long long)build.desc.vs, (unsigned long long)build.desc.ps);
                 failedPairs_.insert(pairKey);
                 return VK_NULL_HANDLE;
             }
             pipelines_[key] = build.pipeline;
             pipelinesAdded_ = true;
             std::fprintf(stderr, "[gpu] frame %d: pipeline %zu built in %.0f ms (vs %016llX ps %016llX%s)\n", g_frame, pipelines_.size(), ms,
-                (unsigned long long)build.vsHash, (unsigned long long)build.psHash, build.rectangles ? ", rectangles" : "");
+                (unsigned long long)build.desc.vs, (unsigned long long)build.desc.ps, build.desc.rectangles ? ", rectangles" : "");
             return build.pipeline;
+        }
+
+        void Renderer::RecordPipeline(const PipelineDesc& desc)
+        {
+            if (!recordedPipelines_.insert(desc.Key()).second)
+                return;
+            if (const char* path = std::getenv("HC09_PIPELINE_LIST"))
+                if (FILE* file = std::fopen(path, "a"))
+                {
+                    std::fputs(desc.ToLine().c_str(), file);
+                    std::fclose(file);
+                }
+        }
+
+        void Renderer::StartPrecompile()
+        {
+            // The APK's list first (pipelines seen while testing), then this phone's own.
+            std::vector<PipelineDesc> list;
+            auto add = [&](const char* text) {
+                for (const char* line = text; line && *line;)
+                {
+                    PipelineDesc desc;
+                    if (desc.FromLine(line) && recordedPipelines_.insert(desc.Key()).second)
+                        list.push_back(desc);
+                    line = std::strchr(line, '\n');
+                    if (line)
+                        line++;
+                }
+            };
+            std::vector<uint8_t> bundled;
+            if (ReadAsset("pipelines.txt", bundled))
+            {
+                bundled.push_back(0);
+                add(reinterpret_cast<const char*>(bundled.data()));
+            }
+            const size_t fromApk = list.size();
+            if (const char* path = std::getenv("HC09_PIPELINE_LIST"))
+                if (FILE* file = std::fopen(path, "rb"))
+                {
+                    std::string text;
+                    char buffer[4096];
+                    size_t count;
+                    while ((count = std::fread(buffer, 1, sizeof(buffer), file)) > 0)
+                        text.append(buffer, count);
+                    std::fclose(file);
+                    add(text.c_str());
+                }
+            if (list.empty() || std::getenv("HC09_NO_PRECOMPILE"))
+                return;
+            std::fprintf(stderr, "[gpu] pre-compiling %zu pipelines (%zu from the APK)\n", list.size(), fromApk);
+
+            // The game waits here (the app shows "Preparing shaders" with the progress): worker threads
+            // build each listed pipeline once and throw it away. What matters is the driver's pipeline
+            // cache, which the game's own builds then hit; it is saved, so later starts only check it.
+            constexpr int kWorkers = 4;
+            struct Shared
+            {
+                std::vector<PipelineDesc> list;
+                std::atomic<size_t> next{ 0 }, built{ 0 }, failed{ 0 };
+                std::atomic<int> running{ kWorkers };
+                std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            };
+            auto shared = std::make_shared<Shared>();
+            shared->list = std::move(list);
+            g_precompileTotal = int(shared->list.size());
+            g_precompileDone = 0;
+            std::vector<std::thread> workers;
+            const VkDevice device = this->device();
+            const VkPipelineCache cache = context_.pipelineCache();
+            const VkShaderModule gs = rectangleGs_;
+            const VkFormat depthFormat = depthFormat_;
+            const bool depthClamp = context_.features().depthClamp;
+            VulkanContext* context = &context_;
+            for (int worker = 0; worker < kWorkers; worker++)
+            {
+                workers.emplace_back([=] {
+                    // Each worker loads its own shader modules (by hash) and makes its own layouts and passes.
+                    std::unordered_map<uint64_t, std::pair<VkShaderModule, std::vector<uint32_t>>> modules;
+                    auto module = [&](uint64_t hash, bool pixel) -> std::pair<VkShaderModule, std::vector<uint32_t>>* {
+                        auto& entry = modules[(hash << 1) | (pixel ? 1 : 0)];
+                        if (entry.first)
+                            return &entry;
+                        char path[96];
+                        std::snprintf(path, sizeof(path), "shaders/%016llX.%s.spv", (unsigned long long)hash, pixel ? "ps" : "vs");
+                        std::vector<uint8_t> bytes;
+                        if (!ReadAsset(path, bytes) || bytes.size() < 20)
+                            return nullptr;
+                        std::vector<uint32_t> words(bytes.size() / 4);
+                        std::memcpy(words.data(), bytes.data(), words.size() * 4);
+                        entry.second = SpirvBindings(words.data(), words.size());
+                        VkShaderModuleCreateInfo info{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                        info.codeSize = words.size() * 4;
+                        info.pCode = words.data();
+                        if (vkCreateShaderModule(device, &info, nullptr, &entry.first) != VK_SUCCESS)
+                            return nullptr;
+                        return &entry;
+                    };
+                    for (size_t i; (i = shared->next++) < shared->list.size();)
+                    {
+                        const PipelineDesc& desc = shared->list[i];
+                        auto* vs = module(desc.vs, false);
+                        auto* ps = module(desc.ps, true);
+                        if (!vs || !ps || (desc.rectangles && !gs))
+                        {
+                            g_precompileDone++;
+                            continue;
+                        }
+                        // The same set layout as GetShaderPair makes (pipeline layouts only need to match).
+                        std::set<uint32_t> bindings(vs->second.begin(), vs->second.end());
+                        bindings.insert(ps->second.begin(), ps->second.end());
+                        std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
+                        for (uint32_t binding : bindings)
+                            layoutBindings.push_back({ HostBinding(binding), BindingType(binding), 1,
+                                VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT | (gs ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) | VK_SHADER_STAGE_FRAGMENT_BIT), nullptr });
+                        VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+                        setInfo.bindingCount = uint32_t(layoutBindings.size());
+                        setInfo.pBindings = layoutBindings.data();
+                        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+                        VkPipelineLayout layout = VK_NULL_HANDLE;
+                        VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                        layoutInfo.setLayoutCount = 1;
+                        layoutInfo.pSetLayouts = &setLayout;
+                        VkRenderPass pass = MakeRenderPass(device, VkFormat(desc.format), desc.samples, depthFormat);
+                        if (vkCreateDescriptorSetLayout(device, &setInfo, nullptr, &setLayout) == VK_SUCCESS &&
+                            vkCreatePipelineLayout(device, &layoutInfo, nullptr, &layout) == VK_SUCCESS && pass)
+                        {
+                            PipelineBuild build;
+                            FillPipeline(desc, vs->first, ps->first, gs, layout, pass, depthClamp,
+                                context->SupportsFormat(VkFormat(desc.format), VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT), build);
+                            VkPipeline pipeline = VK_NULL_HANDLE;
+                            if (vkCreateGraphicsPipelines(device, cache, 1, &build.info, nullptr, &pipeline) == VK_SUCCESS)
+                            {
+                                // Saved as it goes: quitting during "Preparing shaders" keeps what was done.
+                                if (++shared->built % 8 == 0)
+                                    context->SavePipelineCache();
+                                vkDestroyPipeline(device, pipeline, nullptr);
+                            }
+                            else
+                            {
+                                shared->failed++;
+                            }
+                        }
+                        if (pass)
+                            vkDestroyRenderPass(device, pass, nullptr);
+                        vkDestroyPipelineLayout(device, layout, nullptr);
+                        vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+                        g_precompileDone++;
+                    }
+                    for (auto& [key, entry] : modules)
+                        vkDestroyShaderModule(device, entry.first, nullptr);
+                    if (--shared->running == 0)
+                    {
+                        std::fprintf(stderr, "[gpu] pre-compile done: %zu built, %zu failed, %.1f s\n", size_t(shared->built),
+                            size_t(shared->failed),
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - shared->start).count());
+                        context->SavePipelineCache();
+                    }
+                });
+            }
+            for (std::thread& worker : workers)
+                worker.join();
+            g_precompileTotal = 0;
         }
 
         bool Renderer::PrepareIndices(const DrawInfo& draw, std::vector<uint32_t>& indices, bool& indexed, VkPrimitiveTopology& topology,
@@ -2159,6 +2410,11 @@ namespace hc09::gpu
             auto resolved = resolveTargets_.find(frontBuffer & 0x1FFFFFFF);
             ResolveTarget* front = resolved != resolveTargets_.end() && resolved->second.image.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                 ? &resolved->second : nullptr;
+            // HC09_TRACE_SWAPS=1: the front buffer each swap shows and when it was last resolved.
+            static const bool traceSwaps = std::getenv("HC09_TRACE_SWAPS") != nullptr;
+            if (traceSwaps)
+                std::fprintf(stderr, "[swap] frame %d front 0x%08X %s (last resolved frame %d)\n", g_frame, frontBuffer,
+                    front ? "found" : "MISSING", front ? front->lastResolved : -1);
             static bool loggedFront = false;
             if (front && !loggedFront)
             {
@@ -2249,6 +2505,13 @@ namespace hc09::gpu
                 RegisterFloat(0x2114), ReadRegister(0x2080), ReadRegister(0x2081), ReadRegister(0x2082), ReadRegister(0x2307),
                 ReadRegister(0x2308));
         }
+    }
+
+    bool PrecompileProgress(int& done, int& total)
+    {
+        total = g_precompileTotal;
+        done = g_precompileDone;
+        return total > 0;
     }
 
     bool IsDumpFrame()

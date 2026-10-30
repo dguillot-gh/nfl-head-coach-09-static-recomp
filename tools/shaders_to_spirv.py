@@ -29,14 +29,26 @@ SPIRV_OPT_PASSES = ["--scalar-replacement=0", "--ssa-rewrite", "--ccp", "--simpl
 
 
 def split_interpolators(hlsl):
-    """The translator passes 16 interpolators as one array (float4 interpolators[16] : TEXCOORD0). The LG
-    V30's Adreno driver reads such an input array as garbage, so each becomes its own variable
-    (TEXCOORD0..15, the same locations 0..15)."""
+    """The translator passes 16 interpolators as one array (float4 interpolators[16] : TEXCOORD0); each
+    becomes its own variable (TEXCOORD0..15, the same locations 0..15). (Done while chasing the V30's
+    green screen, which turned out to be the image depth; kept: no stage I/O arrays for old drivers.)"""
     members = "".join(f"    float4 interpolator{i} : TEXCOORD{i};\n" for i in range(16))
     hlsl = hlsl.replace("    float4 interpolators[16] : TEXCOORD0;\n", members)
     hlsl = hlsl.replace("    output.interpolators = o;\n", "".join(f"    output.interpolator{i} = o[{i}];\n" for i in range(16)))
     return hlsl.replace("    [unroll] for (int k = 0; k < 16; k++) r[k] = input.interpolators[k];\n",
                         "".join(f"    r[{i}] = input.interpolator{i};\n" for i in range(16)))
+
+
+def unroll_inits(hlsl):
+    """The translator zeroes the register file and outputs with loops ([unroll] for (...) r[i] = 0.0).
+    At -O0 DXC keeps them as loops, and that one dynamic index keeps the whole 64-register array in memory
+    (spirv-opt cannot promote it), which the Pixel 8's compiler takes up to a minute over. No translated
+    shader indexes registers dynamically otherwise, so written out, every register becomes a value."""
+    for loop, array, count in (("    [unroll] for (int i = 0; i < 64; i++) r[i] = 0.0;\n", "r", 64),
+                                ("    [unroll] for (int j = 0; j < 16; j++) o[j] = 0.0;\n", "o", 16),
+                                ("    [unroll] for (int m = 0; m < 4; m++) oC[m] = 0.0;\n", "oC", 4)):
+        hlsl = hlsl.replace(loop, "".join(f"    {array}[{i}] = 0.0;\n" for i in range(count)))
+    return hlsl
 
 
 def main():
@@ -72,7 +84,7 @@ def main():
         profile = "ps_6_0" if name.endswith(".ps") else "vs_6_0"
         target = out / (name + ".spv")
         compiled = out / (name + ".split.hlsl")
-        compiled.write_text(source.read_text() if args.no_split else split_interpolators(source.read_text()))
+        compiled.write_text(unroll_inits(source.read_text() if args.no_split else split_interpolators(source.read_text())))
         command = [args.dxc, "-spirv", "-fspv-target-env=vulkan1.0", "-T", profile, "-E", "main", "-" + args.opt, "-HV", "2018",
                    "-fvk-b-shift", "0", "0", "-fvk-t-shift", str(T_SHIFT), "0", "-fvk-s-shift", str(S_SHIFT), "0",
                    "-Fo", str(target), str(compiled)]

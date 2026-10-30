@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace hc09::gpu
@@ -339,6 +340,8 @@ namespace hc09::gpu
         const char* path = std::getenv("HC09_PIPELINE_CACHE");
         if (!path || !pipelineCache_)
             return;
+        static std::mutex saving;  // (the pre-compile workers save too)
+        std::lock_guard lock(saving);
         size_t size = 0;
         if (vkGetPipelineCacheData(device_, pipelineCache_, &size, nullptr) != VK_SUCCESS || size == 0)
             return;

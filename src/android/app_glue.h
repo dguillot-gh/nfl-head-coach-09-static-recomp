@@ -20,3 +20,9 @@ namespace hc09::android
     // (an acquired reference the caller releases) or null when it went away.
     bool PollWindow(uint64_t& generation, ANativeWindow*& window);
 }
+
+namespace hc09::gpu
+{
+    // The renderer's pipeline pre-compile at start: false when it is not running.
+    bool PrecompileProgress(int& done, int& total);
+}

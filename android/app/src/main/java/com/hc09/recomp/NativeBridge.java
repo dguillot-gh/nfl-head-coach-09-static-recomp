@@ -25,6 +25,9 @@ final class NativeBridge {
     /** Player 1's controller: XInput button bits, triggers 0-255, sticks -32768..32767 (y up). */
     static native void setPad(int buttons, int leftTrigger, int rightTrigger, int leftX, int leftY, int rightX, int rightY);
 
+    /** The shader pre-compile's progress as done << 16 | total, or -1 when it is not running. */
+    static native int shaderProgress();
+
     /** Frames the game has presented so far (0 before it starts). */
     static native int frameNumber();
 

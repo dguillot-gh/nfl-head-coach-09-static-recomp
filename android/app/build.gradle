@@ -77,4 +77,11 @@ tasks.register('copyShaders', Copy) {
     include '*.spv'
     into "$buildDir/generated/hc09Assets/shaders"
 }
-preBuild.dependsOn 'copyShaders'
+// The pipelines seen while playing (the renderer's pipelines.txt from a phone, copied to build/), which
+// the app pre-compiles at start. Also derived from the game: not committed.
+tasks.register('copyPipelineList', Copy) {
+    from "${rootDir}/../build"
+    include 'pipelines.txt'
+    into "$buildDir/generated/hc09Assets"
+}
+preBuild.dependsOn 'copyShaders', 'copyPipelineList'
