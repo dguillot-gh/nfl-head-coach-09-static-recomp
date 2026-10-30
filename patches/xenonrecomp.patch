@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..b73bc81 100644
+index fa91527..738b158 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -609,7 +609,7 @@ bool Recompiler::Recompile(
@@ -45,7 +45,7 @@ index fa91527..b73bc81 100644
          break;
  
      case PPC_INST_BLT:
-@@ -827,23 +831,23 @@ bool Recompiler::Recompile(
+@@ -827,29 +831,30 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_DIVD:
@@ -73,7 +73,33 @@ index fa91527..b73bc81 100644
          if (strchr(insn.opcode->name, '.'))
              println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
          break;
-@@ -1740,6 +1744,197 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // Orders stores (to memory-mapped GPU registers in particular): needed on weakly ordered hosts (ARM).
++        println("\tstd::atomic_thread_fence(std::memory_order_release);");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -1209,7 +1214,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        println("\tstd::atomic_thread_fence(std::memory_order_acq_rel);");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1711,7 +1716,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+         break;
+ 
+     case PPC_INST_TDLGEI:
+@@ -1740,6 +1745,197 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -271,7 +297,7 @@ index fa91527..b73bc81 100644
      case PPC_INST_VADDSHS:
          println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_adds_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
-@@ -1831,7 +2026,17 @@ bool Recompiler::Recompile(
+@@ -1831,7 +2027,17 @@ bool Recompiler::Recompile(
  
      case PPC_INST_VCMPBFP:
      case PPC_INST_VCMPBFP128:
@@ -290,7 +316,7 @@ index fa91527..b73bc81 100644
          break;
  
      case PPC_INST_VCMPEQFP:
-@@ -1875,10 +2080,6 @@ bool Recompiler::Recompile(
+@@ -1875,10 +2081,6 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -301,7 +327,7 @@ index fa91527..b73bc81 100644
      case PPC_INST_VEXPTEFP:
      case PPC_INST_VEXPTEFP128:
          // TODO: vectorize
-@@ -2036,6 +2237,38 @@ bool Recompiler::Recompile(
+@@ -2036,6 +2238,38 @@ bool Recompiler::Recompile(
              }
              break;
  
@@ -340,7 +366,7 @@ index fa91527..b73bc81 100644
          default:
              println("\t__builtin_debugtrap();");
              break;
-@@ -2088,6 +2321,7 @@ bool Recompiler::Recompile(
+@@ -2088,6 +2322,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_VSEL:
@@ -348,7 +374,7 @@ index fa91527..b73bc81 100644
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
  
-@@ -2212,6 +2446,40 @@ bool Recompiler::Recompile(
+@@ -2212,6 +2447,40 @@ bool Recompiler::Recompile(
              println("\t{} = {};", v(insn.operands[0]), vTemp());
              break;
  
@@ -390,10 +416,18 @@ index fa91527..b73bc81 100644
              println("\t__builtin_debugtrap();");
              break;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..0ad216a 100644
+index 31a86cd..1cac9ba 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
-@@ -682,6 +682,80 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+@@ -5,6 +5,7 @@
+ #error "ppc_config.h must be included before ppc_context.h"
+ #endif
+ 
++#include <atomic>
+ #include <climits>
+ #include <cmath>
+ #include <csetjmp>
+@@ -682,6 +683,80 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
      return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
  }
  

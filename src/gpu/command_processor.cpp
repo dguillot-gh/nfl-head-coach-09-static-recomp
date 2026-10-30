@@ -189,8 +189,13 @@ namespace hc09::gpu
             return GpuSwap(raw, address);
         }
 
+        // Memory ordering with the title's threads: the CP thread reads what the title wrote before moving
+        // CP_RB_WPTR (an acquire after reading it), and the title reads what the CP wrote before a fence
+        // value or the read pointer it polls (a release before those writes). x86 orders these by itself;
+        // ARM does not (on the Android phones the CP otherwise read half-written command buffers).
         void GpuWrite(uint32_t address, uint32_t value)
         {
+            std::atomic_thread_fence(std::memory_order_release);
             const uint32_t raw = GpuSwap(value, address);
             std::memcpy(GuestToHost(PhysicalToGuest(address & ~3u)), &raw, 4);
         }
@@ -262,6 +267,7 @@ namespace hc09::gpu
                 // Scratch registers enabled in SCRATCH_UMSK are mirrored to memory at
                 // SCRATCH_ADDR (big-endian); Direct3D uses this for fences.
                 const uint32_t slot = index - kScratchReg0;
+                std::atomic_thread_fence(std::memory_order_release);
                 if (ReadRegister(kScratchUmsk) & (1u << slot))
                     Store<uint32_t>(PhysicalToGuest(ReadRegister(kScratchAddr) + slot * 4), value);
             }
@@ -718,6 +724,7 @@ namespace hc09::gpu
             {
                 ReportStats();
                 const uint32_t writePointer = ReadRegister(reg::kCpRbWptr) % g_ringSizeDwords;
+                std::atomic_thread_fence(std::memory_order_acquire);  // (see GpuWrite)
                 if (writePointer == g_readPointer)
                 {
                     // Idle: yield for a while after the last submission (the title kicks often),
@@ -761,6 +768,7 @@ namespace hc09::gpu
                     continue;
                 }
                 g_readPointer = reader.index();
+                std::atomic_thread_fence(std::memory_order_release);
                 WriteRegister(reg::kCpRbRptr, g_readPointer);
                 if (g_rptrWriteBack)
                     Store<uint32_t>(g_rptrWriteBack, g_readPointer);

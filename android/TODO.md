@@ -75,9 +75,11 @@ Harder than on PS1/DS: the "machine" is our host layer, not an emulator. Plan:
          shaders compile once instead of per pipeline. The V30 (Vulkan 1.0) keeps the current path.
       3. Long term: smaller translated pixel shaders from the translator (unrolling the register init,
          spirv-opt -O and dropping the Adreno 5xx rewrites were measured on 2026-10-30: no gain).
-- [ ] V30 freeze at "Select Favorite Team" (2026-10-30): the game handed the CP malformed indirect buffers
-      ("ends inside a packet", header 0xFFFFFFFF), then WAIT_REG_MEM stalled on a garbage address. Not seen
-      on the Pixel; looks timing-related (command_processor.cpp).
+- [x] V30 freeze at "Select Favorite Team" (2026-10-30): malformed indirect buffers, then WAIT_REG_MEM
+      stalled. ARM memory ordering: sync/lwsync/eieio were no-ops; now fences (recompiler patch + CP).
+- [ ] V30 driver refuses 9+ pipelines with VK_INCOMPLETE on the menus (Coach Now: sky and ground black;
+      up to ~700 draws/frame skipped). Not size-related (7 KB shaders fail, 85 KB ones build), e.g.
+      ps C6100068E4666E5A, 05477D5BC59B1C6F, C0DEA8AD11DC6C29. Find which construct the driver dislikes.
 - [ ] Per-device profiles (V30 vs Pixel 8) and an FPS counter option.
 - [ ] Logs and crash reports to `Android/data/<pkg>/files/logs` (stack traces via unwind).
 - [ ] Keep HC09's debug switches usable on Android (`HC09_PRESS` scripted input, fence/stack tracing)
